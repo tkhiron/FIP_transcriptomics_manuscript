@@ -1,0 +1,1554 @@
+---
+title: "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire - TCR repertoire analysis pipeline"
+author: "Tom Hiron"
+date: "2026"
+output: 
+  html_document:
+    theme: "simplex"
+    toc: true
+    toc_float: true
+    highlight: kate
+    code_folding: show
+    self_contained: true
+---
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE, 
+                      echo = TRUE, 
+                      eval = TRUE,
+                      fig.path = 'figures/',
+                      fig.ext = 'png',
+                      cache = FALSE,
+                      cache.path = 'cache/')
+```
+
+Pipeline to reproduce T Cell Receptor (TCR) repertoire analysis in the manuscript "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire", Hiron et al. 2025, https://www.biorxiv.org/content/10.1101/2025.10.02.679983v1.
+
+## Data availability
+
+Sequencing data supporting the findings of this study have been deposited in the National Center for Biotechnology Information (NCBI) Sequence Read Archive under BioProject ID PRJNA1330231.
+
+## Preparation of feline V(D)J sequence libraries
+
+Sequences for feline V(D)J gene segments available from [IMGT](https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Felis_catus/). JSON libraries built using [repseqio](https://github.com/repseqio/repseqio).
+
+```{r repseqio_buildJSONs, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J repseqio_buildJSONs.job 
+#SBATCH -o repseqio_buildJSONs.out 
+#SBATCH -c 2
+
+repseqio fromPaddedFasta -t 9685 -c TRA -j 3 -n 1 -g V -s cat \
+    -PFR1Begin=0 -PCDR1Begin=78 -PFR2Begin=114 -PCDR2Begin=165 \
+    -PFR3Begin=195 -PCDR3Begin=309 -PVEnd=-1 \
+    TRAV.fasta TRAV.json.fasta TRAV.json
+
+repseqio fromPaddedFasta -t 9685 -c TRA -j 3 -n 1 -g J -s cat \
+    -PJBegin=0 -PFR4Begin=-31 -LFR4Begin='[WF](G.G)' -PFR4End=-1 \
+    TRAJ.fasta TRAJ.json.fasta TRAJ.json
+
+repseqio merge TRAV.json TRAJ.json feline_TRA.json
+
+repseqio fromPaddedFasta -t 9685 -c TRB -j 3 -n 1 -g V -s cat \
+    -PFR1Begin=0 -PCDR1Begin=78 -PFR2Begin=114 -PCDR2Begin=165 \
+    -PFR3Begin=195 -PCDR3Begin=309 -PVEnd=-1 \
+    TRBV.fasta TRBV.json.fasta TRBV.json
+
+repseqio fromPaddedFasta -t 9685 -c TRB -j 3 -n 1 -g D -s cat \
+    -PDBegin=0 -PDEnd=-1 \
+    TRBD.fasta TRBD.json.fasta TRBD.json
+
+repseqio fromPaddedFasta -t 9685 -c TRB -j 3 -n 1 -g J -s cat \
+    -PJBegin=0 -PFR4Begin=-31 -LFR4Begin='[WF](G.G)' -PFR4End=-1 \
+    TRBJ.fasta TRBJ.json.fasta TRBJ.json
+
+repseqio merge TRBV.json TRBD.json TRBJ.json feline_TRB.json
+```
+
+## TCR repertoire analysis with MiXCR
+
+MiXCR v4.7.0.
+
+```{r mixcr_tcr_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J mixcr_tcr_alpha_secondary.job 
+#SBATCH -o mixcr_tcr_alpha_secondary.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+traout=TRA
+trbout=TRB
+
+cd $inpath
+
+fastqs=()
+for fastq in *_1.fastq.gz
+do
+        fastq=${fastq%_1.fastq.gz}
+        fastqs[${#fastqs[@]}]=$fastq
+done
+
+cd $path
+
+#put task here
+file1=$inpath/${fastqs[$i]}_1.fastq.gz
+file2=$inpath/${fastqs[$i]}_2.fastq.gz
+
+mixcr analyze generic-amplicon \
+  --species cat \
+  --library feline_TRA \
+  --rna \
+  --rigid-left-alignment-boundary \
+  --floating-right-alignment-boundary C \
+  --assemble-clonotypes-by CDR3 \
+  $file1 $file2 \
+  $traout/${fastqs[$i]}
+  
+mixcr analyze generic-amplicon \
+  --species cat \
+  --library feline_TRB \
+  --rna \
+  --rigid-left-alignment-boundary \
+  --floating-right-alignment-boundary C \
+  --assemble-clonotypes-by CDR3 \
+  $file1 $file2 \
+  $trbout/${fastqs[$i]}
+```
+
+```{r mixcr_tcr_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fastqs=()
+for fastq in *_1.fastq.gz
+do
+        fastq=${fastq%_1.fastq.gz}
+        fastqs[${#fastqs[@]}]=$fastq
+done
+fastqcount=${#fastqs[@]}
+
+cd $path
+
+sbatch --array 1-$fastqcount:1 mixcr_tcr_alpha_secondary.sh
+```
+
+## Clonotype analysis
+
+Immunarch (https://immunarch.com/).
+
+Load MiXCR data.
+
+```{r immunarch_load}
+library(immunarch)
+library(stringr)
+
+tra_mixcr <- repLoad('mixcr/TRA')
+trb_mixcr <- repLoad('mixcr/TRB')
+
+# TRA - include metadata file in directory with sample, group and IHC result
+names(tra_mixcr$data) <- str_remove(names(tra_mixcr$data), '_tcr.clones_TRA')
+tra_mixcr$meta$Sample <- str_remove(tra_mixcr$meta$Sample, '_tcr.clones_TRA')
+
+# TRB - include metadata file in directory with sample, group and IHC result
+names(trb_mixcr$data) <- str_remove(names(trb_mixcr$data), '_tcr.clones_TRB')
+trb_mixcr$meta$Sample <- str_remove(trb_mixcr$meta$Sample, '_tcr.clones_TRB')
+```
+
+Basic analysis - alpha chain.
+
+```{r immunarch_basicTRA}
+# TRA
+# first, plot the number of clones detected in each sample, faceted by tissue
+tra.clns <- data.frame(lapply(tra_mixcr$data, function(x) sum(x$Clones)))
+tra.clns <- as.data.frame(t(tra.clns))
+tra.clns$sample <- rownames(tra.clns)
+tra.clns$group <- tra_mixcr$meta$Group
+colnames(tra.clns) <- c('Clones', 'Sample', 'Group')
+
+library(immunarch)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+tra.clones.gg <- ggplot(tra.clns, aes(Sample, log10(Clones), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  geom_hline(yintercept = c(3, 3.30103, 3.69897), color = 'black', lty = 'dashed') +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 5)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# consider a reasonable threshold for downsampling
+# plotted above are 1000, 2000 and 5000 clones
+# all samples are retained at the 2000 cut off
+# 4 samples dropped at 5000 (control_115, control_69, fip_176, fip_83)
+# this might be too strict, but ensures sufficient clones for a robust analysis of diversity... 
+# set a threshold of 7618, with control_90 at the minimum
+
+# number of clonotypes
+tra.exp_vol <- repExplore(tra_mixcr$data, .method = 'volume')
+tra.exp_vol$Group <- tra_mixcr$meta$Group
+tra.clntypes.gg <- ggplot(tra.exp_vol, aes(Sample, log10(Volume), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.5)) +
+  labs(x = 'Sample', y = 'Clonotypes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+plot_grid(tra.clones.gg, tra.clntypes.gg,
+          align = 'v', 
+          ncol = 1,
+          axis = 'lr')
+
+# plot clones vs clonotypes
+tra.clns.clntypes <- tra.clns
+tra.clns.clntypes$Volume <- tra.exp_vol$Volume
+tra.clns.clntypes$IHC <- trb_mixcr$meta$IHC
+
+write.table(tra.clns.clntypes, file = 'repseq_tra_clntypes.txt', sep = '\t')
+
+ggplot(tra.clns.clntypes, aes(Clones, Volume, color = IHC)) +
+  geom_point() +
+  geom_text_repel(aes(label = Sample)) +
+  theme_bw()
+
+# CDR3 lengths
+tra.exp_len <- repExplore(tra_mixcr$data, .method = "len", .col = "aa")
+vis(tra.exp_len, .by = c('Group'), .meta = tra_mixcr$meta)
+
+# clearly some very long CDR3 sequences, so some filtering required (filter before downsampling to avoid biasing libraries)
+
+# get count of clones from clonotypes with > 1 read for comparison with RNA-seq
+tra_mixcr.clnfilt <- repFilter(tra_mixcr, .method = "by.clonotype", .query = list(Clones = morethan(1)))
+
+tra.exp_vol <- repExplore(tra_mixcr.clnfilt$data, .method = 'volume')
+tra.exp_vol$Group <- tra_mixcr.clnfilt$meta$Group
+ggplot(tra.exp_vol, aes(Sample, log10(Volume), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.5)) +
+  labs(x = 'Sample', y = 'Clonotypes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+write.table(tra.exp_vol, 'repseq_tra_mincount1_clntypes.txt', sep = '\t')
+```
+
+Basic analysis - beta chain.
+
+```{r immunarch_basicTRB}
+# TRB
+# first, plot the number of clones detected in each sample, faceted by tissue
+trb.clns <- data.frame(lapply(trb_mixcr$data, function(x) sum(x$Clones)))
+trb.clns <- as.data.frame(t(trb.clns))
+trb.clns$sample <- rownames(trb.clns)
+trb.clns$group <- trb_mixcr$meta$Group
+colnames(trb.clns) <- c('Clones', 'Sample', 'Group')
+
+library(immunarch)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+trb.clones.gg <- ggplot(trb.clns, aes(Sample, log10(Clones), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  geom_hline(yintercept = c(3, 3.30103, 3.69897), color = 'black', lty = 'dashed') +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 5)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# consider a reasonable threshold for downsampling, as for TRA
+# similar threshold probably suitable, as at 5000 the same 4 samples are dropped
+# for TRB, 10539 is suitable, with fip_28 at the minimum
+
+# number of clonotypes
+trb.exp_vol <- repExplore(trb_mixcr$data, .method = 'volume')
+trb.exp_vol$Group <- trb_mixcr$meta$Group
+trb.clntypes.gg <- ggplot(trb.exp_vol, aes(Sample, log10(Volume), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.5)) +
+  labs(x = 'Sample', y = 'Clonotypes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+plot_grid(trb.clones.gg, trb.clntypes.gg,
+          align = 'v', 
+          ncol = 1,
+          axis = 'lr')
+
+# plot clones vs clonotypes
+trb.clns.clntypes <- trb.clns
+trb.clns.clntypes$Volume <- trb.exp_vol$Volume
+
+write.table(trb.clns.clntypes, file = 'repseq_trb_clntypes.txt', sep = '\t')
+
+ggplot(trb.clns.clntypes, aes(Clones, Volume, color = Group)) +
+  geom_point() +
+  geom_text_repel(aes(label = Sample)) +
+  theme_bw()
+
+# CDR3 lengths
+trb.exp_len <- repExplore(trb_mixcr$data, .method = "len", .col = "aa")
+vis(trb.exp_len, .by = c('Group'), .meta = trb_mixcr$meta)
+
+# again, some very long CDR3 sequences, so some filtering required (filter before downsampling to avoid biasing libraries)
+
+# get count of clones from clonotypes with > 1 read for comparison with RNA-seq
+trb_mixcr.clnfilt <- repFilter(trb_mixcr, .method = "by.clonotype", .query = list(Clones = morethan(1)))
+
+trb.exp_vol <- repExplore(trb_mixcr.clnfilt$data, .method = 'volume')
+trb.exp_vol$Group <- trb_mixcr.clnfilt$meta$Group
+ggplot(trb.exp_vol, aes(Sample, log10(Volume), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.5)) +
+  labs(x = 'Sample', y = 'Clonotypes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+write.table(trb.exp_vol, 'repseq_trb_mincount1_clntypes.txt', sep = '\t')
+```
+
+Filter out CDR3s of aberrant length and samples with low counts (prior to downsampling). 
+
+
+```{r immunarch_filtering}
+library(immunarch)
+
+# filter clonotypes by CDR3 length 
+# TRA
+for(i in seq_along(tra_mixcr$data)) {
+  tra_mixcr$data[[i]]$CDR3.length <- nchar(tra_mixcr$data[[i]]$CDR3.aa)
+}
+
+tra_mixcr.f <- repFilter(tra_mixcr, .method = 'by.clonotype', .query = list(CDR3.length = lessthan(30)))
+
+# visualise new CDR3 aa length distribution
+tra.filt_len <- repExplore(tra_mixcr.f$data, .method = "len", .col = "aa")
+vis(tra.filt_len, .by = 'Group', .meta = tra_mixcr.f$meta)
+
+# TRB
+for(i in seq_along(trb_mixcr$data)) {
+  trb_mixcr$data[[i]]$CDR3.length <- nchar(trb_mixcr$data[[i]]$CDR3.aa)
+}
+
+trb_mixcr.f <- repFilter(trb_mixcr, .method = 'by.clonotype', .query = list(CDR3.length = lessthan(30)))
+
+# visualise new CDR3 aa length distribution
+trb.filt_len <- repExplore(trb_mixcr.f$data, .method = "len", .col = "aa")
+vis(trb.filt_len, .by = 'Group', .meta = trb_mixcr.f$meta)
+
+# drop samples with low counts (control_115, control_69, fip_176, fip_83)
+tra_mixcr.f <- repFilter(tra_mixcr, .method = 'by.meta', .query = list(Sample = exclude('control_115', 'control_69', 'fip_176', 'fip_83')))
+trb_mixcr.f <- repFilter(trb_mixcr, .method = 'by.meta', .query = list(Sample = exclude('control_115', 'control_69', 'fip_176', 'fip_83')))
+
+# TRA samples
+table(tra_mixcr.f$meta$Group)
+tra.f.exp_vol <- repExplore(tra_mixcr.f$data, .method = "volume")
+vis(tra.f.exp_vol)
+# write.table(tra.f.exp_vol, file = 'tra_clonotypes.txt', sep = '\t')
+
+# TRB samples
+table(trb_mixcr.f$meta$Group)
+trb.f.exp_vol <- repExplore(trb_mixcr.f$data, .method = "volume")
+vis(trb.f.exp_vol)
+# write.table(trb.f.exp_vol, file = 'trb_clonotypes.txt', sep = '\t')
+```
+
+Downsample repertoires.
+
+```{r immunarch_downsample}
+library(immunarch)
+
+# aim is to even out coverage across samples
+# need to manually drop the samples to be filtered out
+# TRA - set to 7618
+tra_mixcr.f.ds <- tra_mixcr.f
+tra_mixcr.f.ds$data <- repSample(tra_mixcr.f$data, .method = 'downsample', .n = 7618)
+
+# TRB - set to 10539
+trb_mixcr.f.ds <- trb_mixcr.f
+trb_mixcr.f.ds$data <- repSample(trb_mixcr.f$data, .method = 'downsample', .n = 10539)
+```
+
+Sample-level stats - alpha chain.
+
+```{r immunarch_statsTRA}
+library(immunarch)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# exploratory analysis
+tra.exp_cnt <- repExplore(tra_mixcr.f.ds$data, .method = "count")
+
+vis(tra.exp_cnt, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+# clonality
+tra_pr <- repClonality(tra_mixcr.f.ds$data, .method = 'clonal.prop')
+tra_top <- repClonality(tra_mixcr.f.ds$data, .method = 'top', .head = c(10, 100, 1000, 3000, 10000))
+tra_rare <- repClonality(tra_mixcr.f.ds$data, .method = 'rare')
+tra_hom <- repClonality(tra_mixcr.f.ds$data,
+  .method = "homeo",
+  .clone.types = c(Small = .0001, Medium = .001, Large = .01, Hyperexpanded = 1)
+)
+
+vis(tra_pr, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+vis(tra_top)
+vis(tra_top, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+vis(tra_rare)
+vis(tra_rare, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+# re-plot with new sample order based on IHC result
+ihc.sample_order <- c("control_52", "control_54", "control_56", "control_57", "control_63", "control_78", "control_80", "control_84", "control_90",
+                       "control_91", "control_102", "control_111", "control_123", "control_130", "control_135", "control_136", "control_141", "control_144",
+                       "control_164", "control_174", "control_182", "control_188", "fip_81", "fip_92", "fip_96", "fip_142", "fip_146", "fip_151", "fip_192",
+                       "fip_34", "fip_35", "fip_36", "fip_68", "fip_86", "fip_120", "fip_172", "fip_28", "fip_37", "fip_108", "fip_129", "fip_173")
+
+tra_rare <- tra_rare[ihc.sample_order,]
+
+# borrowed preprocessing code from immunarch github - https://github.com/immunomind/immunarch/blob/master/R/vis.R
+  tmp <- tra_rare
+  if (is.null(dim(tmp))) {
+    tmp <- t(as.matrix(tmp))
+    tra_rare <- t(as.matrix(tra_rare))
+  }
+
+  colnames_new <- c()
+  prev_value <- "1"
+  start_index <- 1
+  if (colnames(tra_rare)[1] == "1") {
+    colnames_new <- "1"
+    prev_value <- "2"
+    start_index <- 2
+  }
+  for (i in start_index:ncol(tra_rare)) {
+    colnames_new <- c(colnames_new, paste0(prev_value, " - ", colnames(tra_rare)[i]))
+    if (colnames(tra_rare)[i] != "MAX") {
+      prev_value <- as.character(as.integer(colnames(tra_rare)[i]) + 1)
+    }
+  }
+  colnames(tmp) <- colnames_new
+
+  for (i in 2:ncol(tra_rare)) {
+    tmp[, i] <- tra_rare[, i] - tra_rare[, i - 1]
+  }
+  tra.res <- tmp
+
+  tra.res <- as.data.frame(tra.res)
+  tra.res$Sample <- row.names(tra.res)
+  tra.res <- reshape2::melt(tra.res)
+  colnames(tra.res) <- c("Sample", "Counts", "Value")
+  
+  tra.res$Sample <- factor(tra.res$Sample, levels = ihc.sample_order)
+
+ggplot(tra.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  scale_y_continuous(expand = c(0,0), labels = seq(0,100,25)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Occupied repertoire space (%)', fill = 'Clonotype counts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+vis(tra_hom)
+vis(tra_hom, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+# diversity estimates
+# chao
+alpha.chao <- repDiversity(tra_mixcr.f.ds$data, 'chao1')
+
+vis(alpha.chao, .by = 'IHC', .meta = tra_mixcr.f.ds$meta)
+
+# nice boxplots
+alpha.chao.df <- as.data.frame(alpha.chao)
+alpha.chao.df$IHC <- tra_mixcr.f.ds$meta$IHC
+
+compare_means(Estimator ~ IHC, data = alpha.chao.df)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.chao.gg <- ggplot(alpha.chao.df, aes(IHC, Estimator, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 40000)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 37000) +
+  labs(x = '', y = 'Chao1 index') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# gini
+alpha.div_gini <- repDiversity(tra_mixcr.f.ds$data, 'gini')
+alpha.div_gini <- as.data.frame(alpha.div_gini)
+alpha.div_gini$group <- tra_mixcr.f.ds$meta$Group
+alpha.div_gini$IHC <- tra_mixcr.f.ds$meta$IHC
+
+# get p values
+compare_means(V1 ~ IHC, data = alpha.div_gini)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.gini.gg <- ggplot(alpha.div_gini, aes(IHC, V1, group = IHC, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 1)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 1) +
+  labs(x = '', y = 'Gini coefficient') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# align chao and gini plots to get equal sized plots
+plot_grid(alpha.chao.gg, alpha.gini.gg,
+          align = 'v', 
+          ncol = 1,
+          axis = 'lr')
+```
+
+Sample-level stats - beta chain.
+
+```{r immunarch_statsTRB}
+library(immunarch)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# exploratory analysis
+trb.exp_cnt <- repExplore(trb_mixcr.f.ds$data, .method = "count")
+
+vis(trb.exp_cnt, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+# clonality
+trb_pr <- repClonality(trb_mixcr.f.ds$data, .method = 'clonal.prop')
+trb_top <- repClonality(trb_mixcr.f.ds$data, .method = 'top', .head = c(10, 100, 1000, 3000, 10000))
+trb_rare <- repClonality(trb_mixcr.f.ds$data, .method = 'rare')
+trb_hom <- repClonality(trb_mixcr.f.ds$data,
+  .method = "homeo",
+  .clone.types = c(Small = .0001, Medium = .001, Large = .01, Hyperexpanded = 1)
+)
+
+vis(trb_pr, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+vis(trb_top)
+vis(trb_top, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+vis(trb_rare)
+vis(trb_rare, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+# re-plot with new sample order based on IHC result
+ihc.sample_order <- c("control_52", "control_54", "control_56", "control_57", "control_63", "control_78", "control_80", "control_84", "control_90",
+                       "control_91", "control_102", "control_111", "control_123", "control_130", "control_135", "control_136", "control_141", "control_144",
+                       "control_164", "control_174", "control_182", "control_188", "fip_81", "fip_92", "fip_96", "fip_142", "fip_146", "fip_151", "fip_192",
+                       "fip_34", "fip_35", "fip_36", "fip_68", "fip_86", "fip_120", "fip_172", "fip_28", "fip_37", "fip_108", "fip_129", "fip_173")
+
+trb_rare <- trb_rare[ihc.sample_order,]
+
+# borrowed preprocessing code from immunarch github - https://github.com/immunomind/immunarch/blob/master/R/vis.R
+  tmp <- trb_rare
+  if (is.null(dim(tmp))) {
+    tmp <- t(as.matrix(tmp))
+    trb_rare <- t(as.matrix(trb_rare))
+  }
+
+  colnames_new <- c()
+  prev_value <- "1"
+  start_index <- 1
+  if (colnames(trb_rare)[1] == "1") {
+    colnames_new <- "1"
+    prev_value <- "2"
+    start_index <- 2
+  }
+  for (i in start_index:ncol(trb_rare)) {
+    colnames_new <- c(colnames_new, paste0(prev_value, " - ", colnames(trb_rare)[i]))
+    if (colnames(trb_rare)[i] != "MAX") {
+      prev_value <- as.character(as.integer(colnames(trb_rare)[i]) + 1)
+    }
+  }
+  colnames(tmp) <- colnames_new
+
+  for (i in 2:ncol(trb_rare)) {
+    tmp[, i] <- trb_rare[, i] - trb_rare[, i - 1]
+  }
+  trb.res <- tmp
+
+  trb.res <- as.data.frame(trb.res)
+  trb.res$Sample <- row.names(trb.res)
+  trb.res <- reshape2::melt(trb.res)
+  colnames(trb.res) <- c("Sample", "Counts", "Value")
+  
+  trb.res$Sample <- factor(trb.res$Sample, levels = ihc.sample_order)
+
+ggplot(trb.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  scale_y_continuous(expand = c(0,0), labels = seq(0,100,25)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Occupied repertoire space (%)', fill = 'Clonotype counts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+vis(trb_hom)
+vis(trb_hom, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+# diversity estimates
+# chao
+beta.chao <- repDiversity(trb_mixcr.f.ds$data, 'chao1')
+
+vis(beta.chao, .by = 'IHC', .meta = trb_mixcr.f.ds$meta)
+
+# nice boxplots
+beta.chao.df <- as.data.frame(beta.chao)
+beta.chao.df$IHC <- trb_mixcr.f.ds$meta$IHC
+
+compare_means(Estimator ~ IHC, data = beta.chao.df)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+beta.chao.gg <- ggplot(beta.chao.df, aes(IHC, Estimator, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 60000)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 57000) +
+  labs(x = '', y = 'Chao1 index') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# gini
+beta.div_gini <- repDiversity(trb_mixcr.f.ds$data, 'gini')
+beta.div_gini <- as.data.frame(beta.div_gini)
+beta.div_gini$group <- trb_mixcr.f.ds$meta$Group
+beta.div_gini$IHC <- trb_mixcr.f.ds$meta$IHC
+
+# get p values
+compare_means(V1 ~ IHC, data = beta.div_gini)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+beta.gini.gg <- ggplot(beta.div_gini, aes(IHC, V1, group = IHC, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, show.legend = FALSE, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 1)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 1) +
+  labs(x = '', y = 'Gini coefficient') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# align chao and gini plots to get equal sized plots
+plot_grid(beta.chao.gg, beta.gini.gg,
+          align = 'v', 
+          ncol = 1,
+          axis = 'lr')
+```
+
+Repertoire overlap and public clonotypes.
+
+```{r immunarch_overlap}
+library(immunarch)
+
+# TRA
+# public - simple count of public clonotypes
+tra_ov1 <- repOverlap(tra_mixcr.f.ds$data[ihc.sample_order], .method = 'public', .verbose = F)
+vis(tra_ov1, 'heatmap2', cluster_rows = FALSE, cluster_cols = FALSE)
+vis(tra_ov1, .text.size = 0) +
+  labs(x = '', y = '', title = 'Public clonotypes')
+
+# jaccard - jaccard index, size of intersection/size of union
+tra_ov2 <- repOverlap(tra_mixcr.f.ds$data[ihc.sample_order], .method = 'jaccard', .verbose = F)
+vis(tra_ov2, 'heatmap2', cluster_rows = FALSE, cluster_cols = FALSE)
+vis(tra_ov2, .text.size = 0) +
+  labs(x = '', y = '', title = 'Jaccard index')
+
+# public repertoire
+tra.pr.aa <- pubRep(tra_mixcr.f.ds$data, "aa", .verbose = F)
+
+# TRB
+# public - simple count of public clonotypes
+trb_ov1 <- repOverlap(trb_mixcr.f.ds$data[ihc.sample_order], .method = 'public', .verbose = F)
+vis(trb_ov1, 'heatmap2', cluster_rows = FALSE, cluster_cols = FALSE)
+vis(trb_ov1, .text.size = 0) +
+  labs(x = '', y = '', title = 'Public clonotypes')
+
+# jaccard - jaccard index, size of intersection/size of union
+trb_ov2 <- repOverlap(trb_mixcr.f.ds$data[ihc.sample_order], .method = 'jaccard', .verbose = F)
+vis(trb_ov2, 'heatmap2', cluster_rows = FALSE, cluster_cols = FALSE)
+vis(trb_ov2, .text.size = 0) +
+  labs(x = '', y = '', title = 'Jaccard index')
+
+# public repertoire
+trb.pr.aa <- pubRep(trb_mixcr.f.ds$data, "aa", .verbose = F)
+```
+
+Gene usage.
+
+First fix the functions distributed with immunarch.
+
+```{r immunarch_gene_usage_altfunctions}
+geneUsage2 <- function(.data, # df, list, MonetDB
+                      .gene = c("hs.trbv", "HomoSapiens.TRBJ", "macmul.IGHV"),
+                      .quant = c(NA, "count"),
+                      .ambig = c("inc", "exc", "maj"),
+                      .type = c("segment", "allele", "family"),
+                      .norm = FALSE) {
+  .type <- .type[1]
+  .ambig <- .ambig[1]
+  .quant <- .quant[1]
+  .gene <- .gene[1]
+  
+  if (immunarch:::has_class(.data, "list")) {
+    if (length(.data) == 1) {
+      return(geneUsage2(.data[[1]], .gene = .gene, .quant = .quant, .ambig = .ambig, .norm = .norm))
+    } else {
+      genedata <- lapply(.data, geneUsage2,
+                         .gene = .gene, .quant = .quant,
+                         .ambig = .ambig, .type = .type, .norm = .norm
+      )
+      
+      # Add check if list has 1 element
+      for (i in 2:(length(genedata))) {
+        if (i > 2) {
+          allres <- full_join(allres, genedata[[i]], by = "Names")
+          names(allres)[i + 1] <- names(genedata)[i]
+        } else {
+          allres <- full_join(genedata[[1]], genedata[[2]], by = "Names")
+          names(allres)[2] <- names(genedata)[1]
+          names(allres)[3] <- names(genedata)[2]
+        }
+      }
+      allres <- allres[order(allres$Names), ]
+      
+      return(immunarch:::add_class(allres, "immunr_gene_usage"))
+    }
+  }
+  
+  "%!in%" <- function(x, y) !("%in%"(x, y))
+  
+  which_gene <- strsplit(.gene, ".", TRUE)[[1]][2]
+  gene_col <- tolower(substr(which_gene, 4, 4))
+  if (gene_col == "v") {
+    gene_col <- immunarch:::IMMCOL$v
+  } else if (gene_col == "d") {
+    gene_col <- immunarch:::IMMCOL$d
+  } else if (gene_col == "j") {
+    gene_col <- immunarch:::IMMCOL$j
+  } else {
+    stop("The entered gene_col name is invalid")
+  }
+  
+  .gene <- get_genes2(.gene, .type)
+  
+  # Bad Cases:
+  # X.name is segments, .type == "alleles"
+  # X.name is families, .type == "segments"
+  # X.name is families, .type == "alleles"
+  
+  if (.ambig == "inc") {
+    if (.type == "segment") {
+      .data[[gene_col]] <- immunarch:::return_segments(.data[[gene_col]])
+    } else if (.type == "family") {
+      .data[[gene_col]] <- immunarch:::return_families(.data[[gene_col]])
+    }
+  }
+  
+  if (immunarch:::has_class(.data, "data.table")) {
+    .data <- .data %>% lazy_dt()
+  }
+  dataset <- .data %>%
+    select(Gene = gene_col, immunarch:::IMMCOL$count) %>%
+    group_by(Gene) %>%
+    rename(Quant = immunarch:::IMMCOL$count)
+  
+  if (is.na(.quant)) {
+    dataset <- dataset %>%
+      summarise(count = n())
+  } else {
+    dataset <- dataset %>%
+      summarise(count = sum(Quant))
+  }
+  
+  dataset <- dataset %>%
+    collect(n = Inf)
+  
+  if (.ambig == "inc") {
+    res <- dataset
+    names(res) <- c("Names", immunarch:::IMMCOL$count)
+  } else {
+    gene_col_split <- strsplit(dataset[["Gene"]], ", ", fixed = TRUE, useBytes = TRUE)
+    counts <- dataset$count
+    names(counts) <- dataset[["Gene"]]
+    
+    if (.ambig == "exc") {
+      included_names <- names(counts) %in% gene_col_split[sapply(gene_col_split, length) == 1]
+      chosen <- counts[included_names]
+      chosen <- chosen[names(chosen) %in% .gene]
+      other <- counts[names(chosen) %!in% .gene]
+      res <- data.frame(
+        Names = names(chosen),
+        Count = unlist(chosen), stringsAsFactors = FALSE
+      )
+    } else if (.ambig == "maj") {
+      maj_counts <- data.frame(Names = sapply(gene_col_split, "[[", 1), Counts = counts, stringsAsFactors = FALSE)
+      row.names(maj_counts) <- NULL
+      res <- maj_counts %>%
+        group_by(Names) %>%
+        summarise(Counts = sum(Counts))
+    }
+  }
+  if (length(.gene %in% res[[1]]) < length(.gene)) {
+    missing <- data.frame(.gene[!.gene %in% res[[1]]],
+                          0,
+                          stringsAsFactors = FALSE
+    )
+    names(missing) <- names(res)
+    res <- rbind(res, missing)
+  }
+  row.names(res) <- NULL
+  res <- res[order(res[[1]]), ]
+  if (.norm) {
+    res[, 2] <- res[, 2] / sum(res[, 2])
+  }
+  res <- as_tibble(as.data.frame(res))
+  immunarch:::add_class(res, "immunr_gene_usage")
+}
+
+
+
+get_genes2 <- function(.gene = c("hs.trbv", "HomoSapiens.trbj", "macmul.ighv"), .type = c("segment", "allele", "family")) {
+  .gene <- .gene[1]
+  .type <- .type[1]
+  
+  # Species
+  .gene <- tolower(.gene)
+  which_species <- strsplit(.gene, ".", TRUE)[[1]][1]
+  if (which_species %in% GENE_SEGMENTS2$alias) {
+    which_species_col <- "alias"
+  } else {
+    if (which_species %in% tolower(GENE_SEGMENTS2$species)) {
+      which_species_col <- "species"
+    } else {
+      stop("Unknown species name / alias")
+    }
+  }
+  
+  # Genes
+  which_gene <- strsplit(.gene, ".", TRUE)[[1]][2]
+  if (!(which_gene %in% GENE_SEGMENTS2[["gene"]][tolower(GENE_SEGMENTS2[[which_species_col]]) == which_species])) {
+    stop("Unknown gene name")
+  }
+  
+  # Id's type
+  which_type <- paste0(.type, "_id")
+  
+  sort(unique(GENE_SEGMENTS2[[which_type]][tolower(GENE_SEGMENTS2[[which_species_col]]) == which_species & GENE_SEGMENTS2[["gene"]] == which_gene]))
+}
+```
+
+```{r immunarch_gene_usage}
+tra_mixcr.f.gu <- tra_mixcr.f.ds
+
+library(immunarch)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+
+tra_mixcr.f.gu$data <- tra_mixcr.f$data %>% 
+  map(~ .x %>% mutate(V.name = gsub('\\*01\\(.{2,7}\\)', '', V.name), 
+                      J.name = gsub('\\*01\\(.{2,7}\\)', '', J.name)))
+
+# constructed GENE_SEGMENTS entries for feline VDJ genes - formatted as follows
+# alias	species	gene	family_id	segment_id	allele_id	reference_point	sequence
+# fc	FelisCatus	traj	TRAJ1	TRAJ1	TRAJ1*01		
+# fc	FelisCatus	traj	TRAJ10	TRAJ10	TRAJ10*01		
+# fc	FelisCatus	traj	TRAJ11	TRAJ11	TRAJ11*01		
+# fc	FelisCatus	traj	TRAJ12	TRAJ12	TRAJ12*01		
+
+# read in and rbind
+feline.gene_segments <- read.csv(file = 'gene_segments_cat.txt', sep = '\t', header = T)
+GENE_SEGMENTS2 <- rbind(GENE_SEGMENTS, feline.gene_segments)
+
+# calculate and plot gene usage
+# TRAV
+trav_gu <- geneUsage2(tra_mixcr.f.gu$data, "fc.trav", .quant = 'count', .ambig = 'exc', .norm = T)
+vis(trav_gu, .by = "Group", .plot = 'box', .meta = tra_mixcr.f.gu$meta)
+vis(trav_gu, .by = "IHC", .plot = 'box', .meta = tra_mixcr.f.gu$meta)
+
+trav_gu2 <- as.data.frame(trav_gu)
+rownames(trav_gu2) <- trav_gu2$Names
+trav_gu2$Names <- NULL
+trav_gu2 <- trav_gu2[,ihc.sample_order]
+trav.breaks = seq(0,0.2,0.005)
+trav.cols = colorRampPalette(brewer.pal(9, 'YlGnBu'))(length(trav.breaks))
+pheatmap(trav_gu2, cluster_cols = FALSE, breaks = trav.breaks, color = trav.cols)
+
+trav_gu_cor <- geneUsageAnalysis(trav_gu, .method = "cor", .verbose = F)
+vis(trav_gu_cor, .title = "Gene usage correlation", .leg.title = "Cor", .text.size = 0)
+
+# TRAJ
+traj_gu <- geneUsage2(tra_mixcr.f.gu$data, "fc.traj", .quant = 'count', .ambig = 'exc', .norm = T)
+vis(traj_gu, .by = "Group", .plot = 'box', .meta = tra_mixcr.f.gu$meta)
+vis(traj_gu, .by = "IHC", .plot = 'box', .meta = tra_mixcr.f.gu$meta)
+
+traj_gu2 <- as.data.frame(traj_gu)
+rownames(traj_gu2) <- traj_gu2$Names
+traj_gu2$Names <- NULL
+traj_gu2 <- traj_gu2[,ihc.sample_order]
+traj.breaks = seq(0,0.2,0.005)
+traj.cols = colorRampPalette(brewer.pal(9, 'YlGnBu'))(length(traj.breaks))
+pheatmap(traj_gu2, cluster_rows = FALSE, cluster_cols = FALSE, breaks = traj.breaks, color = traj.cols)
+
+traj_gu_cor <- geneUsageAnalysis(traj_gu, .method = "cor", .verbose = F)
+vis(traj_gu_cor, .title = "Gene usage correlation", .leg.title = "Cor", .text.size = 0)
+
+# prepare trb
+trb_mixcr.f.gu <- trb_mixcr.f.ds
+
+trb_mixcr.f.gu$data <- trb_mixcr.f$data %>% 
+  map(~ .x %>% mutate(V.name = gsub('\\*01\\(.{2,7}\\)', '', V.name), 
+                      J.name = gsub('\\*01\\(.{2,7}\\)', '', J.name)))
+
+# TRBV
+trbv_gu <- geneUsage2(trb_mixcr.f.gu$data, "fc.trbv", .quant = 'count', .ambig = 'exc', .norm = T)
+vis(trbv_gu, .by = "Group", .plot = 'box', .meta = trb_mixcr.f.gu$meta, .test = T)
+vis(trbv_gu, .by = "IHC", .plot = 'box', .meta = trb_mixcr.f.gu$meta, .test = T)
+
+trbv_gu2 <- as.data.frame(trbv_gu)
+rownames(trbv_gu2) <- trbv_gu2$Names
+trbv_gu2$Names <- NULL
+trbv_gu2 <- trbv_gu2[,ihc.sample_order]
+trbv.breaks = seq(0,0.3,0.005)
+trbv.cols = colorRampPalette(brewer.pal(9, 'YlGnBu'))(length(trbv.breaks))
+pheatmap(trbv_gu2, cluster_cols = FALSE, breaks = trbv.breaks, color = trbv.cols)
+
+trbv_gu_cor <- geneUsageAnalysis(trbv_gu, .method = "cor", .verbose = F)
+vis(trbv_gu_cor, .title = "Gene usage correlation", .leg.title = "Cor", .text.size = 0)
+
+# TRBJ
+trbj_gu <- geneUsage2(trb_mixcr.f.gu$data, "fc.trbj", .quant = 'count', .ambig = 'exc', .norm = T)
+vis(trbj_gu, .by = "Group", .meta = trb_mixcr.f.gu$meta, .test = T)
+vis(trbj_gu, .by = "IHC", .meta = trb_mixcr.f.gu$meta, .test = T)
+
+trbj_gu2 <- as.data.frame(trbj_gu)
+rownames(trbj_gu2) <- trbj_gu2$Names
+trbj_gu2$Names <- NULL
+trbj_gu2 <- trbj_gu2[,ihc.sample_order]
+trbj.breaks = seq(0,0.4,0.005)
+trbj.cols = colorRampPalette(brewer.pal(9, 'YlGnBu'))(length(trbj.breaks))
+pheatmap(trbj_gu2, cluster_cols = FALSE, breaks = trbj.breaks, color = trbj.cols)
+
+trbj_gu_cor <- geneUsageAnalysis(trbj_gu, .method = "cor", .verbose = F)
+vis(trbj_gu_cor, .title = "Gene usage correlation", .leg.title = "Cor", .text.size = 0)
+```
+
+## Network analysis (NAIR)
+
+https://mlizhangx.github.io/Network-Analysis-for-Repertoire-Sequencing-/
+
+```{r nair_fipclusters_alpha}
+library(tidyverse)
+library(NAIR)
+library(igraph)
+library(ggraph)
+
+# stash data
+alpha.dat <- tra_mixcr.f.ds$data
+control.dat <- tra_mixcr.f.ds$data[1:22]
+fcovneg.samples <- c("fip_81", "fip_92", "fip_96", "fip_142", "fip_146", "fip_151", "fip_192")
+fcovplus.samples <- c("fip_34", "fip_35", "fip_36", "fip_68", "fip_86", "fip_120", "fip_172")
+
+# save each sample as rds
+lapply(names(alpha.dat), function(x) saveRDS(alpha.dat[[x]], file = paste0('nair/tcr_manuscript/alpha/', paste0(x, '.rds'))))
+
+# define input files
+alpha.input.files <- list.files(path = 'nair/tcr_manuscript/alpha', pattern = '.rds', full.names = TRUE)
+group_labels <- c(rep('Control', 22), rep('FIP', 19))
+
+# find associated seqs - takes a while to run so results saved and loaded from a txt file
+# alpha.associated_seqs <- findAssociatedSeqs(file_list = alpha.input.files,
+#                                       input_type = 'rds',
+#                                       group_ids = group_labels,
+#                                       seq_col = 'CDR3.aa',
+#                                       freq_col = 'Proportion',
+#                                       min_seq_length = NULL,
+#                                       drop_matches = NULL,
+#                                       min_sample_membership = NULL,
+#                                       pval_cutoff = 0.05)
+
+# write.table(alpha.associated_seqs, file = 'alpha_associated_seqs_tcr_manuscript.txt', sep = '\t')
+alpha.associated_seqs <- read.csv('alpha_associated_seqs_tcr_manuscript.txt', sep = '\t')
+
+# find associated clones (top 20 seqs)
+findAssociatedClones(file_list = alpha.input.files,
+                     input_type = 'rds',
+                     group_ids = group_labels,
+                     seq_col = 'CDR3.aa',
+                     assoc_seqs = alpha.associated_seqs$ReceptorSeq,
+                     min_seq_length = NULL,
+                     drop_matches = NULL,
+                     output_dir = 'nair/tcr_manuscript/alpha/assoc_seq_nbds',
+                     sample_ids = names(alpha.dat))
+
+# combine neighbourhoods and perform network analysis
+alpha.nbd.input <- list.files('nair/tcr_manuscript/alpha/assoc_seq_nbds', full.names = TRUE)
+
+alpha.all_clusters <- buildAssociatedClusterNetwork(file_list = alpha.nbd.input,
+                                                    seq_col = 'CDR3.aa',
+                                                    size_nodes_by = 'Proportion',
+                                                    print_plots = TRUE,
+                                                    drop_isolated_nodes = FALSE)
+
+# export CDR3s to get pGens with OLGA
+alpha.all_clusters.cdr3 <- data.frame(unique(alpha.all_clusters$node_data$CDR3.aa))
+# write.table(alpha.all_clusters.cdr3, file = 'alpha_all_clusters_unique_cdr3s_tcr_manuscript.txt', sep = '\t')
+
+# add IHC group to node data
+control.samples <- names(control.dat)
+alpha.all_clusters$node_data$IHC <- ifelse(alpha.all_clusters$node_data$SampleID %in% control.samples, 'Control', 
+                                           ifelse(alpha.all_clusters$node_data$SampleID %in% fcovneg.samples, 'FCoV -',
+                                                  ifelse(alpha.all_clusters$node_data$SampleID %in% fcovplus.samples, 'FCoV +', 'FCoV ND')))
+# export network for visualisation in gephi
+alpha.all_clusters.elist <- igraph::as_edgelist(alpha.all_clusters$igraph, names = T)
+write.table(alpha.all_clusters.elist, file = 'alpha_all_clusters_edgelist_tcr_manuscript.csv', sep = ',')
+write.table(alpha.all_clusters$node_data, file = 'alpha_all_clusters_nodedata_tcr_manuscript.csv', sep = ',')
+```
+
+Prepare network visualisation in Gephi (https://gephi.org/).
+
+```{r nair_fipclusters_hmap_alpha}
+# for all clusters
+alpha.all <- alpha.all_clusters$node_data
+# count of clonotypes
+clntyp.count.matrix <- unclass(table(alpha.all$AssocSeq, alpha.all$SampleID))
+# mean frequency
+clntyp.freq.matrix <- reshape2::acast(alpha.all, cluster_id ~ SampleID, value.var = 'Proportion', fun.aggregate = mean, fill = 0)
+# change column order to group by IHC
+clntyp.freq.ihc <- clntyp.freq.matrix[,ihc.sample_order]
+
+# set row order by delta mean freq
+clntyp.freq.ihc.df <- as.data.frame(clntyp.freq.ihc)
+clntyp.freq.ihc.df$control_mean <- rowMeans(subset(clntyp.freq.ihc.df, select = c(1:22)))
+clntyp.freq.ihc.df$fip_mean <- rowMeans(subset(clntyp.freq.ihc.df, select = c(23:41)))
+clntyp.freq.ihc.df$delta <- clntyp.freq.ihc.df$fip_mean - clntyp.freq.ihc.df$control_mean
+clntyp.freq.ihc.df <- clntyp.freq.ihc.df[order(clntyp.freq.ihc.df$delta, decreasing = FALSE),]
+# add sample count for alt plot
+clntyp.freq.ihc.df$nsamples <- rowSums(clntyp.freq.ihc.df[,1:41] > 0)
+# and control/fip-exclusive clusters
+clntyp.freq.ihc.df$control_excl <- clntyp.freq.ihc.df$fip_mean == 0
+clntyp.freq.ihc.df$fip_excl <- clntyp.freq.ihc.df$control_mean == 0
+# convert to matrix for hmap
+clntyp.freq.ihc.mat <- as.matrix(clntyp.freq.ihc.df[,1:41])
+
+library(pheatmap)
+library(RColorBrewer)
+breaks = seq(0, 0.001, 0.00001)
+hmcols = colorRampPalette(brewer.pal(9, 'OrRd'))(length(breaks))
+pheatmap(clntyp.freq.ihc.mat,
+         breaks = breaks,
+         color = hmcols,
+         border_color = NA,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize_row = 5,
+         angle_col = 45,
+         gaps_col = c(22,29,36))
+
+# plot delta mean freq to add to main hmap in illustrator
+paletteLength <- 1000
+delta.cols <- colorRampPalette(c('#32A7CD', 'white', '#8F3092'))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(clntyp.freq.ihc.df$delta), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(clntyp.freq.ihc.df$delta)/paletteLength, max(clntyp.freq.ihc.df$delta), length.out=floor(paletteLength/2)))
+
+pheatmap(as.matrix(clntyp.freq.ihc.df$delta), 
+         breaks = myBreaks, 
+         color = delta.cols, 
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE, 
+         border_color = NA)
+```
+
+Calculate TCR generation probabilities (pGen) using OLGA (https://github.com/statbiophys/OLGA).
+
+First, generate recombination models using Pygor (https://github.com/statbiophys/pygor3) with non-functional CDR3 sequences.
+
+```{r pgen_models, engine = 'bash', eval = FALSE}
+pygor model-create -M models/Felis+catus/TRA/ -t VJ
+pygor igor-infer -M models/Felis+catus/TRA/ -i nonfunc/all_samples_nonfunc_cdr3_seqsonly_TRA.txt -o new_TRA
+
+pygor model-create -M models/Felis+catus/TRB/ -t VDJ
+pygor igor-infer -M models/Felis+catus/TRB/ -i nonfunc/all_samples_nonfunc_cdr3_seqsonly_TRB.txt -o new_TRB
+```
+
+Calculate pGens for FIP-associated clonotypes.
+
+```{r pgen_calc, engine = 'bash', eval = FALSE}
+olga-compute_pgen --set_custom_model_VJ models/TRA/ -i unique_cdr3s/alpha_all_clusters_unique_cdr3s_tcr_manuscript.txt -o output/alpha_all_clusters_unique_cdr3s_tcr_manuscript_pgens.tsv
+
+olga-compute_pgen --set_custom_model_VDJ models/TRB/ -i unique_cdr3s/beta_all_clusters_unique_cdr3s_tcr_manuscript.txt -o output/beta_all_clusters_unique_cdr3s_tcr_manuscript_pgens.tsv
+```
+
+```{r nair_fipclusters_pgenplots_alpha}
+library(ggrepel)
+
+# read in pGens from OLGA and merge with clone node data
+alpha.all_clusters.pgens <- read.csv('alpha_all_clusters_unique_cdr3s_tcr_manuscript_pgens.tsv', sep = '\t', header = TRUE)
+alpha_pgens <- merge(alpha.all_clusters$node_data, alpha.all_clusters.pgens, by.x = 'CDR3.aa', by.y = 'Seq', all.x = TRUE)
+
+# calculate median cluster pGen
+alpha.assoccluster.pgen <- alpha_pgens %>%
+  group_by(cluster_id) %>%
+  summarise(medianpgen = median(Score, na.rm = TRUE))
+
+# get cluster data for plotting
+clntyp.freq.ihc.df$cluster_id <- rownames(clntyp.freq.ihc.df)
+freq.pgen.plot <- subset(clntyp.freq.ihc.df, select = c(cluster_id, delta, nsamples, control_excl, fip_excl))
+freq.pgen.plot <- merge(freq.pgen.plot, alpha.assoccluster.pgen, by = 'cluster_id', all.x = TRUE)
+
+# add seq_w_max_degree for labelling
+alpha.clusterstat <- subset(alpha.all_clusters$cluster_data, select = c(cluster_id, seq_w_max_degree))
+freq.pgen.plot <- merge(freq.pgen.plot, alpha.clusterstat, by = 'cluster_id', all.x = TRUE)
+
+# plot
+ggplot(freq.pgen.plot, aes(x = delta, y = medianpgen, size = nsamples)) +
+  geom_vline(xintercept = 0, color = 'darkgrey', lty = 'dashed') +
+  geom_point(shape = 21) +
+  geom_point(data = freq.pgen.plot[freq.pgen.plot$fip_excl == TRUE,], aes(x = delta, y = medianpgen, size = nsamples), shape = 21, fill = '#8F3092') +
+  geom_point(data = freq.pgen.plot[freq.pgen.plot$control_excl == TRUE,], aes(x = delta, y = medianpgen, size = nsamples), shape = 21, fill = '#32A7CD') +
+  # geom_text_repel(aes(label = seq_w_max_degree, size = 5), show.legend = FALSE) +
+  scale_x_continuous(limits = c(-0.0005,0.001), breaks = seq(-5e-04, 1e-03, 2.5e-04)) +
+  scale_y_continuous(limits = c(50, 140), breaks = seq(50, 140, 10)) +
+  scale_size_continuous(breaks = seq(5,25,10)) +
+  labs(x = 'Δ cluster mean frequency (FIP - Control)', y = expression(-log[2]*' cluster median pGen')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot zoomed view of selected clusters
+# top 20?
+clusters.plot <- alpha.associated_seqs[order(alpha.associated_seqs$fisher_pvalue, decreasing = FALSE),]$ReceptorSeq[1:20]
+
+alpha.pgens.plot <- alpha_pgens[alpha_pgens$AssocSeq %in% clusters.plot,]
+
+ggplot(alpha.pgens.plot, aes(Proportion, Score, fill = IHC)) +
+  geom_point(shape = 21) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  facet_wrap(vars(AssocSeq), nrow = 4) +
+  labs(x = 'Clonotype frequency', y = expression(-log[2]*' clonotype pGen')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7),
+        axis.text.y = element_text(size = 7),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 7))
+```
+
+```{r nair_fipclusters_subset_alpha}
+library(igraph)
+library(ggraph)
+library(ggseqlogo)
+
+# subset and plot nodes from key clusters, i.e. top-ranked clusters from hmap (ranked by delta mean freq)
+# Control clusters - 3, 44
+# cluster 3
+control3.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 3,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(control3.net$igraph)$size <- control3.net$node_data$Proportion
+# set vertex group id
+V(control3.net$igraph)$group <- control3.net$node_data$IHC
+# get nice plot
+control3.gg <- ggraph(control3.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', 'darkgray')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# cluster 44
+control44.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 44,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(control44.net$igraph)$size <- control44.net$node_data$Proportion
+# set vertex group id
+V(control44.net$igraph)$group <- control44.net$node_data$IHC
+# get nice plot
+control44.gg <- ggraph(control44.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', 'darkgray')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# FIP clusters - 106, 86, 96, 80
+# cluster 106 - max freq 0.0002625361
+fip106.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 106,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(fip106.net$igraph)$size <- fip106.net$node_data$Proportion
+# set vertex group id
+V(fip106.net$igraph)$group <- fip106.net$node_data$IHC
+# get nice plot
+fip106.gg <- ggraph(fip106.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#D071AD', 'darkgray')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# cluster 86 - max freq 0.0055132581
+fip86.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 86,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(fip86.net$igraph)$size <- fip86.net$node_data$Proportion
+# set vertex group id
+V(fip86.net$igraph)$group <- fip86.net$node_data$IHC
+# get nice plot
+fip86.gg <- ggraph(fip86.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#8F3092', 'darkgray')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# cluster 96 - max freq 0.1034392229
+fip96.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 96,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(fip96.net$igraph)$size <- fip96.net$node_data$Proportion
+# set vertex group id
+V(fip96.net$igraph)$group <- fip96.net$node_data$IHC
+# get nice plot
+fip96.gg <- ggraph(fip96.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#D071AD', '#8F3092')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# cluster 80 - max freq 0.1671042268
+fip80.net <- buildNet(data = alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 80,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(fip80.net$igraph)$size <- fip80.net$node_data$Proportion
+# set vertex group id
+V(fip80.net$igraph)$group <- fip80.net$node_data$IHC
+# get nice plot
+fip80.gg <- ggraph(fip80.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#D071AD', '#8F3092')) +
+  scale_size_continuous(limits = c(0,0.18), range = c(3, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+plot_grid(control3.gg, fip106.gg, fip96.gg, control44.gg, fip86.gg, fip80.gg, nrow = 2)
+
+
+# seqlogo
+control3.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 3,]
+control3.logo <- ggseqlogo(control3.seq$CDR3.aa, method = 'probability')
+
+control44.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 44,]
+control44.logo <- ggseqlogo(control44.seq$CDR3.aa, method = 'probability')
+
+fip106.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 106,]
+fip106.logo <- ggseqlogo(fip106.seq$CDR3.aa, method = 'probability')
+
+fip86.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 86,]
+fip86.logo <- ggseqlogo(fip86.seq$CDR3.aa, method = 'probability')
+
+fip96.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 96,]
+fip96.logo <- ggseqlogo(fip96.seq$CDR3.aa, method = 'probability')
+
+fip80.seq <- alpha.all_clusters$node_data[alpha.all_clusters$node_data$cluster_id == 80,]
+fip80.logo <- ggseqlogo(fip80.seq$CDR3.aa, method = 'probability')
+
+plot_grid(control3.logo, fip106.logo, fip96.logo, control44.logo, fip86.logo, fip80.logo, nrow = 2)
+```
+
+```{r nair_fipclusters_beta}
+# stash data
+beta.dat <- trb_mixcr.f.ds$data
+control.dat <- trb_mixcr.f.ds$data[1:22]
+fcovneg.samples <- c("fip_81", "fip_92", "fip_96", "fip_142", "fip_146", "fip_151", "fip_192")
+fcovplus.samples <- c("fip_34", "fip_35", "fip_36", "fip_68", "fip_86", "fip_120", "fip_172")
+
+# save each sample as rds
+lapply(names(beta.dat), function(x) saveRDS(beta.dat[[x]], file = paste0('nair/tcr_manuscript/beta/', paste0(x, '.rds'))))
+
+# define input files
+beta.input.files <- list.files(path = 'nair/tcr_manuscript/beta', pattern = '.rds', full.names = TRUE)
+group_labels <- c(rep('Control', 22), rep('FIP', 19))
+
+# find associated seqs - takes a while to run so results saved and loaded from a txt file
+# beta.associated_seqs <- findAssociatedSeqs(file_list = beta.input.files,
+#                                       input_type = 'rds',
+#                                       group_ids = group_labels,
+#                                       seq_col = 'CDR3.aa',
+#                                       freq_col = 'Proportion',
+#                                       min_seq_length = NULL,
+#                                       drop_matches = NULL,
+#                                       min_sample_membership = NULL,
+#                                       pval_cutoff = 0.05)
+
+# write.table(beta.associated_seqs, file = 'beta_associated_seqs_tcr_manuscript.txt', sep = '\t')
+beta.associated_seqs <- read.csv('beta_associated_seqs_tcr_manuscript.txt', sep = '\t')
+
+# find associated clones (top 20 seqs)
+findAssociatedClones(file_list = beta.input.files,
+                     input_type = 'rds',
+                     group_ids = group_labels,
+                     seq_col = 'CDR3.aa',
+                     assoc_seqs = beta.associated_seqs$ReceptorSeq,
+                     min_seq_length = NULL,
+                     drop_matches = NULL,
+                     output_dir = 'nair/tcr_manuscript/beta/assoc_seq_nbds',
+                     sample_ids = names(beta.dat))
+
+# combine neighbourhoods and perform network analysis
+beta.nbd.input <- list.files('nair/tcr_manuscript/beta/assoc_seq_nbds', full.names = TRUE)
+
+beta.all_clusters <- buildAssociatedClusterNetwork(file_list = beta.nbd.input,
+                                                    seq_col = 'CDR3.aa',
+                                                    size_nodes_by = 'Proportion',
+                                                    print_plots = TRUE,
+                                                    drop_isolated_nodes = FALSE)
+
+# export CDR3s to get pGens with OLGA
+beta.all_clusters.cdr3 <- data.frame(unique(beta.all_clusters$node_data$CDR3.aa))
+# write.table(beta.all_clusters.cdr3, file = 'beta_all_clusters_unique_cdr3s_tcr_manuscript.txt', sep = '\t')
+
+# add IHC group to node data
+control.samples <- names(control.dat)
+beta.all_clusters$node_data$IHC <- ifelse(beta.all_clusters$node_data$SampleID %in% control.samples, 'Control', 
+                                           ifelse(beta.all_clusters$node_data$SampleID %in% fcovneg.samples, 'FCoV -',
+                                                  ifelse(beta.all_clusters$node_data$SampleID %in% fcovplus.samples, 'FCoV +', 'FCoV ND')))
+# export network for visualisation in gephi
+beta.all_clusters.elist <- igraph::as_edgelist(beta.all_clusters$igraph, names = T)
+write.table(beta.all_clusters.elist, file = 'beta_all_clusters_edgelist_tcr_manuscript.csv', sep = ',')
+write.table(beta.all_clusters$node_data, file = 'beta_all_clusters_nodedata_tcr_manuscript.csv', sep = ',')
+```
+
+Prepare network in Gephi.
+
+```{r nair_fipclusters_hmap_beta}
+# for all clusters
+beta.all <- beta.all_clusters$node_data
+# count of clonotypes
+clntyp.count.matrix <- unclass(table(beta.all$AssocSeq, beta.all$SampleID))
+# mean frequency
+clntyp.freq.matrix <- reshape2::acast(beta.all, cluster_id ~ SampleID, value.var = 'Proportion', fun.aggregate = mean, fill = 0)
+# add columns for missing samples
+clntyp.freq.matrix <- as.data.frame(clntyp.freq.matrix)
+clntyp.freq.matrix$control_56 <- 0
+clntyp.freq.matrix$control_57 <- 0
+clntyp.freq.matrix$control_78 <- 0
+clntyp.freq.matrix$control_90 <- 0
+clntyp.freq.matrix$control_91 <- 0
+clntyp.freq.matrix$control_102 <- 0
+clntyp.freq.matrix$control_111 <- 0
+clntyp.freq.matrix$control_130 <- 0
+clntyp.freq.matrix$control_135 <- 0
+clntyp.freq.matrix$control_188 <- 0
+clntyp.freq.matrix$fip_129 <- 0
+clntyp.freq.matrix <- as.matrix(clntyp.freq.matrix)
+
+# change column order to group by IHC
+clntyp.freq.ihc <- clntyp.freq.matrix[,ihc.sample_order]
+
+# set row order by delta mean freq
+clntyp.freq.ihc.df <- as.data.frame(clntyp.freq.ihc)
+clntyp.freq.ihc.df$control_mean <- rowMeans(subset(clntyp.freq.ihc.df, select = c(1:22)))
+clntyp.freq.ihc.df$fip_mean <- rowMeans(subset(clntyp.freq.ihc.df, select = c(23:41)))
+clntyp.freq.ihc.df$delta <- clntyp.freq.ihc.df$fip_mean - clntyp.freq.ihc.df$control_mean
+clntyp.freq.ihc.df <- clntyp.freq.ihc.df[order(clntyp.freq.ihc.df$delta, decreasing = FALSE),]
+# add sample count for alt plot
+clntyp.freq.ihc.df$nsamples <- rowSums(clntyp.freq.ihc.df[,1:41] > 0)
+# and control/fip-exclusive clusters
+clntyp.freq.ihc.df$control_excl <- clntyp.freq.ihc.df$fip_mean == 0
+clntyp.freq.ihc.df$fip_excl <- clntyp.freq.ihc.df$control_mean == 0
+# convert to matrix for hmap
+clntyp.freq.ihc.mat <- as.matrix(clntyp.freq.ihc.df[,1:41])
+
+library(pheatmap)
+library(RColorBrewer)
+breaks = seq(0, 0.0007, 0.00001)
+hmcols = colorRampPalette(brewer.pal(9, 'OrRd'))(length(breaks))
+pheatmap(clntyp.freq.ihc.mat,
+         breaks = breaks,
+         color = hmcols,
+         border_color = NA,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         fontsize_row = 7,
+         angle_col = 45,
+         gaps_col = c(22,29,36))
+
+# plot delta mean freq to add to main hmap in illustrator
+paletteLength <- 1000
+delta.cols <- colorRampPalette(c('#32A7CD', 'white', '#8F3092'))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(clntyp.freq.ihc.df$delta), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(clntyp.freq.ihc.df$delta)/paletteLength, max(clntyp.freq.ihc.df$delta), length.out=floor(paletteLength/2)))
+
+pheatmap(as.matrix(clntyp.freq.ihc.df$delta), 
+         breaks = myBreaks, 
+         color = delta.cols, 
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE, 
+         border_color = NA)
+```
+
+
+```{r nair_fipclusters_pgenplots_beta}
+library(ggrepel)
+
+# read in pGens from OLGA and merge with clone node data
+beta.all_clusters.pgens <- read.csv('beta_all_clusters_unique_cdr3s_tcr_manuscript_pgens.tsv', sep = '\t', header = TRUE)
+beta_pgens <- merge(beta.all_clusters$node_data, beta.all_clusters.pgens, by.x = 'CDR3.aa', by.y = 'Seq', all.x = TRUE)
+
+# calculate median cluster pGen
+beta.assoccluster.pgen <- beta_pgens %>%
+  group_by(cluster_id) %>%
+  summarise(medianpgen = median(Score, na.rm = TRUE))
+
+# get cluster data for plotting
+clntyp.freq.ihc.df$cluster_id <- rownames(clntyp.freq.ihc.df)
+freq.pgen.plot <- subset(clntyp.freq.ihc.df, select = c(cluster_id, delta, nsamples, control_excl, fip_excl))
+freq.pgen.plot <- merge(freq.pgen.plot, beta.assoccluster.pgen, by = 'cluster_id', all.x = TRUE)
+
+# add seq_w_max_degree for labelling
+beta.clusterstat <- subset(beta.all_clusters$cluster_data, select = c(cluster_id, seq_w_max_degree))
+freq.pgen.plot <- merge(freq.pgen.plot, beta.clusterstat, by = 'cluster_id', all.x = TRUE)
+
+# plot
+ggplot(freq.pgen.plot, aes(x = delta, y = medianpgen, size = nsamples)) +
+  geom_vline(xintercept = 0, color = 'darkgrey', lty = 'dashed') +
+  geom_point(shape = 21) +
+  geom_point(data = freq.pgen.plot[freq.pgen.plot$fip_excl == TRUE,], aes(x = delta, y = medianpgen, size = nsamples), shape = 21, fill = '#8F3092') +
+  geom_point(data = freq.pgen.plot[freq.pgen.plot$control_excl == TRUE,], aes(x = delta, y = medianpgen, size = nsamples), shape = 21, fill = '#32A7CD') +
+  # geom_text_repel(aes(label = seq_w_max_degree, size = 5), show.legend = FALSE) +
+  scale_x_continuous(limits = c(-0.0001,0.0001), breaks = seq(-0.0001, 0.0001, 2.5e-05)) +
+  # scale_y_continuous(limits = c(50, 140), breaks = seq(50, 140, 10)) +
+  scale_size_continuous(breaks = seq(5,25,10)) +
+  labs(x = 'Δ cluster mean frequency (FIP - Control)', y = expression(-log[2]*' cluster median pGen')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot zoomed view of selected clusters
+# top 20?
+clusters.plot <- beta.associated_seqs[order(beta.associated_seqs$fisher_pvalue, decreasing = FALSE),]$ReceptorSeq[1:20]
+
+beta.pgens.plot <- beta_pgens[beta_pgens$AssocSeq %in% clusters.plot,]
+
+ggplot(beta.pgens.plot, aes(Proportion, Score, fill = IHC)) +
+  geom_point(shape = 21) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  facet_wrap(vars(AssocSeq), nrow = 4) +
+  labs(x = 'Clonotype frequency', y = expression(-log[2]*' clonotype pGen')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7),
+        axis.text.y = element_text(size = 7),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 7))
+```
+
+```{r nair_fipclusters_subset_beta}
+library(igraph)
+library(ggraph)
+library(ggseqlogo)
+
+# subset and plot nodes from key clusters, i.e. top-ranked clusters from hmap (ranked by delta mean freq)
+# cluster 12
+fip12.net <- buildNet(data = beta.all_clusters$node_data[beta.all_clusters$node_data$cluster_id == 12,],
+                      seq_col = 'CDR3.aa')
+
+# set node size to frequency
+V(fip12.net$igraph)$size <- fip12.net$node_data$Proportion
+# set vertex group id
+V(fip12.net$igraph)$group <- fip12.net$node_data$IHC
+# get nice plot
+fip12.gg <- ggraph(fip12.net$igraph, layout = 'fr', maxiter = 10000) +
+  geom_edge_link(color = 'darkgrey', edge_width = 0.2) +
+  geom_node_point(aes(size = size, fill = group), shape = 21) +
+  scale_fill_manual(values = c('#D071AD', '#8F3092', 'darkgray')) +
+  scale_size_continuous(limits = c(0,0.0011), range = c(2, 8)) +
+  labs(size = '', title = '', fill = '') +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# seqlogo
+fip12.seq <- beta.all_clusters$node_data[beta.all_clusters$node_data$cluster_id == 12,]
+fip12.logo <- ggseqlogo(fip12.seq$CDR3.aa, method = 'probability')
+```
+
+## Additional plots from RNA-seq repertoire analysis
+
+Correlation between TCR-seq and RNA-seq.
+
+```{r corr}
+# read in data
+corr <- read.csv('top_clonotypes_tra_targetvsrnaseq.txt', sep = '\t', header = TRUE)
+
+topclon.gg <- ggplot(corr, aes(sqrt(rnaseq), sqrt(tcrseq), color = detection)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c('navyblue', 'lightgrey')) +
+  labs(x = 'Square root top TRA clonotype proportion (RNA-seq)', y = 'Square root top TRA clonotype proportion (targeted)', color = 'Detected in') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# clonotype correlation
+clntype.corr <- read.csv('rnaseq_tcrseq_clntype_corr.txt', sep = '\t', header = TRUE)
+clntype.corr$Group <- c(rep('Control', 7), 'FIP', 'FIP (focal renal)', 'FIP', 'FIP (focal renal)', rep('FIP', 4))
+
+clntyp.gg <- ggplot(clntype.corr, aes(rnaseq, tcrseq, color = Group)) +
+  geom_point(size = 2) +
+  scale_x_continuous(limits = c(1,4)) +
+  scale_y_continuous(limits = c(1,4)) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  geom_abline(slope = 1, lty = 'dashed', color = 'darkgrey') +
+  labs(x = 'log10 TRA clonotypes (RNA-seq)', y = 'log10 TRA clonotypes (targeted)', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+

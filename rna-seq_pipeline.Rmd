@@ -1,0 +1,1598 @@
+---
+title: "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire - RNA-seq analysis pipeline"
+author: "Tom Hiron"
+date: "2026"
+output: 
+  html_document:
+    theme: "simplex"
+    toc: true
+    toc_float: true
+    highlight: kate
+    code_folding: show
+    self_contained: true
+---
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE, 
+                      echo = TRUE, 
+                      eval = TRUE,
+                      fig.path = 'figures/',
+                      fig.ext = 'png',
+                      cache = FALSE,
+                      cache.path = 'cache/')
+```
+
+Pipeline to reproduce RNA-seq analyses in the manuscript "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire", Hiron et al. 2025, https://www.biorxiv.org/content/10.1101/2025.10.02.679983v1.
+
+## Data availability
+
+Sequencing data supporting the findings of this study have been deposited in the National Center for Biotechnology Information (NCBI) Sequence Read Archive under BioProject ID PRJNA1330231.
+
+## Alignment 
+
+STAR v2.7.11b.
+
+Build index for felCat9 Ensembl release 111:
+
+```{r alignSTAR_index, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J build_STAR_index_fc9_ensembl111.job 
+#SBATCH -o build_STAR_index_fc9_ensembl111.out 
+#SBATCH -c 8
+
+refdir=felCat9
+
+STAR --runThreadN 8 --runMode genomeGenerate \
+--genomeDir fc9_ens111_STAR_index \
+--genomeFastaFiles $refdir/Felis_catus.Felis_catus_9.0.dna.toplevel.fa \
+--sjdbGTFfile $refdir/Felis_catus.Felis_catus_9.0.111.gtf \
+--sjdbOverhang 149
+```
+
+Mapping:
+
+```{r align_STAR_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J align_STAR.job 
+#SBATCH -o align_STAR.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+outpath=alignments
+
+cd $inpath
+
+fnames=()
+for fname in *_1.fastq.gz
+do
+	fname=${fname%_1.fastq.gz}
+	fnames[${#fnames[@]}]=$fname
+done
+
+cd $path
+
+#input variables
+seqfile1=$inpath/${fnames[$i]}_1.fastq.gz
+seqfile2=$inpath/${fnames[$i]}_2.fastq.gz
+
+#other variables
+outprefix=$outpath/${fnames[$i]}_
+refdir=fc9_ens111_STAR_index
+
+STAR --runThreadN 2 --genomeDir $refdir --readFilesIn $seqfile1 $seqfile2 --outFileNamePrefix $outprefix --outSAMunmapped Within \
+    --outFilterMultimapNmax 10 --alignSJoverhangMin 5 --alignSJDBoverhangMin 3 --outFilterMismatchNmax 10 --outFilterMismatchNoverLmax 0.04 \
+    --alignIntronMin 21 --alignIntronMax 0 --alignMatesGapMax 0 --outFilterIntronMotifs RemoveNoncanonical --outSAMtype BAM SortedByCoordinate \
+    --readFilesCommand zcat
+```
+
+```{r align_STAR_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+outpath=alignments
+
+cd $inpath
+
+fnames=()
+for fname in *_1.fastq.gz
+do
+	fname=${fname%_1.fastq.gz}
+	fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+cd $path
+
+sbatch --array 1-$fnamecount:1 align_STAR_secondary.sh
+```
+
+## Filtering
+
+Samtools v1.21.
+
+Filter alignments to retain uniquely aligned and properly paired reads. 
+
+```{r bam_filter_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J bam_filter.job 
+#SBATCH -o bam_filter.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+outpath=filtered
+
+fnames=()
+for fname in *.sortedByCoord.out.bam
+do
+        fname=${fname%.sortedByCoord.out.bam}
+        fnames[${#fnames[@]}]=$fname
+done
+
+infile=$path/${fnames[$i]}.sortedByCoord.out.bam
+outfile=$outpath/${fnames[$i]}.filtered.bam
+
+#function
+samtools view -h -b -f 2 -q 255 $infile > $outfile
+samtools index $outfile
+```
+
+```{r bam_filter_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+fnames=()
+for fname in *.sortedByCoord.out.bam
+do
+        fname=${fname%.sortedByCoord.out.bam}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+sbatch --array 1-$fnamecount:1 bam_filter_secondary.sh
+```
+
+## STAR stats
+
+```{r STARlogs}
+library(reshape2)
+library(ggplot2)
+library(viridis)
+library(stringr)
+library(ggsci)
+
+# patched functions from the hciR package: https://github.com/HuntsmanCancerInstitute/hciR/
+extract_samples <- function(files){
+  ## capture sample in file name  or path
+  x <- lapply( strsplit(files, "/"), rev)
+  samples <- sapply(x, "[", 1 )
+  # remove file extension
+  samples <- gsub("\\..*", "", samples)
+  if( any(duplicated(samples )) ){
+      # use parent directory
+      samples <- sapply(x, "[", 2 )
+  }
+  if( any(duplicated(samples )) ){
+      samples <- sapply(x, "[", 3 )
+  }
+  if( any(duplicated(samples )) ){
+     stop("Sample names are not unique:  \n  ", paste(files, collapse="\n  "), call.=FALSE)
+  }
+  samples
+}
+
+read_sample_files <- function(path=".", pattern="\\.counts$", delim="\t",  ...){
+   outfiles <- list.files(path, pattern, recursive=TRUE, full.names=TRUE)
+   if(length(outfiles) == 0) stop("No ", pattern, " files found in ", path, call.=FALSE)
+   samples <- extract_samples(outfiles)
+
+   out1 <- vector("list", length(outfiles))
+   for(i in seq_along(outfiles)){
+       message("Reading ", outfiles[i])
+       x <- suppressMessages( readr::read_delim(outfiles[i], delim=delim, ...) )
+       ## requires tibble > 1.2 (to add single name into column)
+       out1[[i]] <- tibble::add_column (x, sample= samples[i], .before=1)
+   }
+   dplyr::bind_rows(out1)
+}
+
+read_STAR <- function( path=".", pattern, reshape=FALSE){
+   if(missing(pattern))  pattern <- "\\.final.out$"
+   # suppress warnings about subheaders....  Warning: 4 parsing failures.
+   x <- suppressWarnings( read_sample_files(path, pattern, col_names=c("stat", "value") , skip=5, trim_ws=TRUE ))
+
+   x <- dplyr::filter(x, !is.na(value)) %>%                    # drop subheader with NA value ... UNIQUE READS:
+  dplyr::mutate( stat = gsub(" \\|$", "", stat),              # remove pipe from end of statistic
+                 stat = gsub("Number of reads m", "M", stat), # shorten  Number of reads mapped to...
+                 stat = gsub(" reads number", "", stat),      #  shorten Uniquely mapped reads number
+                value = gsub("%", "", value),                 # drop % from value
+                value = as.numeric(value))                    # change value to numeric
+
+   # ADD unmapped reads  -
+   mapped <- c("Uniquely mapped",  "Mapped to multiple loci", "Mapped to too many loci" )
+   # see http://stackoverflow.com/questions/40749742/add-missing-subtotals-to-each-group-using-dplyr
+   x <- dplyr::group_by(x, sample) %>%
+          dplyr::summarize(  value = value[stat == 'Number of input reads'] - sum(value[stat %in% mapped ]),
+                     stat = 'Unmapped reads' ) %>%
+          dplyr::bind_rows(x) %>%
+           dplyr::select(sample, stat, value) %>%  # back to original column order
+            dplyr::arrange(sample)
+
+   ##  split unmapped reads into too many mismatches, too short and  other?
+   #  divide %unmapped too short  by total %unmapped  and muliply by Unmapped reads to get estimate
+
+   if(reshape){
+      n <- c(mapped,  "Unmapped reads", "Number of input reads" )
+      x <- dplyr::filter(x, stat %in% n) %>%
+            dplyr::mutate( stat = factor(stat, levels= n)) %>%
+             tidyr::spread( stat, value)  %>%
+              dplyr::mutate(across(-1, ~ as.integer(.x))) # patched here for dplyr >= 1.0.0
+   }
+   x
+}
+
+# read in STAR logs, combine multimapping reads columns and subset
+x <- read_STAR(path = 'STAR_logs', reshape = TRUE)
+x$sample <- str_remove(x$sample, '_Log')
+
+# sum rows from same sample if split over lanes
+x <- aggregate(. ~ sample, data = x, FUN = sum)
+
+x$`Multi-mapping` <- x$`Mapped to multiple loci` + x$`Mapped to too many loci`
+x2 <- subset(x, select = c(1, 2, 7, 5))
+x2$Group <- c(rep('Control', 21), rep('FIP', 21))
+
+# define tissue value based on sample name
+x2$Tissue <- ifelse(grepl('liver', x2$sample), 'Liver', ifelse(grepl('lung', x2$sample), 'Lung', 'MLN'))
+
+# export table
+# write.table(x2, 'tables/mapping_stats.txt', sep = '\t', quote = FALSE, row.names = FALSE)
+
+# melt df for plotting
+x2.melt <- reshape2::melt(x2)
+x2.melt$variable <- factor(x2.melt$variable, levels = rev(c('Uniquely mapped', 'Multi-mapping', 'Unmapped reads')))
+
+# plot
+ggplot(x2.melt, aes(x = sample, y = value/1e6, fill = variable)) +
+  geom_bar(position = "stack", stat = "identity") +
+  facet_grid(cols = vars(Tissue), scales = 'free_x', space = 'free') +
+  scale_fill_viridis(discrete = TRUE, direction = -1, begin = 0.1, end = 0.95, option = 'viridis') +
+  scale_y_continuous(expand = c(0,0), limits = c(0,200)) +
+  labs(x = '', y = bquote('Paired-end Reads'~(x10^6)), fill = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+
+## Read summarisation
+
+Samtools v1.21.
+
+Sort alignments by name: 
+
+```{r bam_nameSort_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J bam_nameSort.job 
+#SBATCH -o bam_nameSort.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+bams=()
+for bam in *filtered.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+
+#define variables
+infile=$path/${bams[$i]}.bam
+outfile=$path/${bams[$i]}.nameSorted.bam
+
+#function
+samtools sort -n -@ 4 $infile -o $outfile
+```
+
+```{r bam_nameSort_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+bams=()
+for bam in *filtered.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+bamcount=${#bams[@]}
+
+sbatch --array 1-$bamcount:1 bam_nameSort_secondary.sh
+```
+
+Rsubread v2.20.
+
+Get gene-level counts:
+
+```{r read_summ, eval = FALSE}
+bam.files <- list.files(pattern = "*nameSorted.bam$", full.names = TRUE)
+
+library(Rsubread)
+
+feature.counts <- featureCounts(files = bam.files, 
+                                annot.ext = "Felis_catus.Felis_catus_9.0.111.gtf", 
+                                isGTFAnnotationFile = TRUE, 
+                                GTF.attrType = 'gene_id', 
+                                isPairedEnd = TRUE, 
+                                nthreads = 4)
+```
+
+## PCA (all tissues)
+
+```{r edgeR_counts}
+# extract the count table and store as a DGElist object
+library(edgeR)
+library(stringr)
+
+counts <- as.data.frame(feature.counts$counts)
+counts$Gene <- rownames(counts)
+rownames(counts) <- NULL
+counts <- subset(counts, select = c(43, 1:42))
+
+y <- DGEList(counts = counts[,2:43], genes = counts$Gene, remove.zeros = TRUE)
+
+y$samples$group <- factor(c(rep('Control', 21), rep('FIP', 21)), levels = c('Control', 'FIP'))
+y$samples$tissue <- x2$Tissue
+
+# recalculate library sizes
+y$samples$lib.size <- colSums(y$counts)
+
+# use Ensembl IDs as row names
+rownames(y$counts) <- rownames(y$genes) <- y$genes$genes
+
+# TMM Normalisation
+y <- calcNormFactors(y)
+y$samples
+
+# design matrix
+Group <- y$samples$group
+Tissue <- y$samples$tissue
+data.frame(Sample = colnames(y), Group, Tissue)
+
+design <- model.matrix(~Group+Tissue)
+rownames(design) <- colnames(y)
+design
+
+# filtering
+dim(y)
+keep <- filterByExpr(y, design)
+y <- y[keep,]
+dim(y)
+
+base.counts <- cpm(y, normalized.lib.sizes = TRUE)
+log.base.counts <- cpm(y, prior.count = 1, log = TRUE, normalized.lib.sizes = TRUE)
+
+# PCA
+pca.n = prcomp(t(log.base.counts))
+scores.n  = as.data.frame(pca.n$x)
+attach(scores.n)
+
+var.capn = summary(pca.n)
+pc_var.capn = round(var.capn$importance[2,]*100, 1)
+cum_var.capn = round(var.capn$importance[3,]*100, 1)
+sample.ids <- colnames(counts.corrected[2:ncol(counts.corrected)])
+
+library(ggplot2)
+library(ggdendro)
+library(reshape2)
+
+pca_plot <- scores.n[,1:2]
+pca_plot$sample <- rownames(pca_plot)
+pca_plot$group <- y$samples$group
+pca_plot$tissue <- y$samples$tissue
+
+# edit group for focal renal samples
+pca_plot$group <- ifelse(grepl('FIP', pca_plot$group), ifelse(grepl('fip_142|fip_192', pca_plot$sample), 'FIP (focal renal)', 'FIP'), 'Control')
+
+library(ggrepel)
+library(ggsci)
+library(viridis)
+library(ggsci)
+
+ggplot(pca_plot, aes(PC1, PC2)) +
+  geom_point(aes(shape = group, fill = tissue), size = 3) +
+  scale_shape_manual(values = c(21, 23, 25)) +
+  # geom_text_repel(aes(x = PC1, y = PC2, label = sample), max.overlaps = 20) +
+  scale_fill_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  geom_hline(linetype = 3, yintercept = 0) +
+  geom_vline(linetype = 3, xintercept = 0) +
+  labs(x = paste('PC1: ', pc_var.capn[1], sep = '', '% of variance'), 
+       y = paste('PC2: ', pc_var.capn[2], sep = '', '% of variance'), 
+       fill = '', shape = '') +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Differentially expressed genes
+
+### Liver FIP vs Control
+
+```{r liver_degs}
+liver.counts <- subset(counts, select = c(1, grep('liver', colnames(counts))))
+
+# make dgelist
+y.liver <- DGEList(counts = liver.counts[,-c(1)], genes = liver.counts$Gene, remove.zeros = TRUE)
+
+y.liver$samples$group <- factor(c(rep('Control', length(grep('control', rownames(y.liver$samples)))), rep('FIP', length(grep('fip', rownames(y.liver$samples))))), levels = c('Control', 'FIP'))
+
+# recalculate library sizes
+y.liver$samples$lib.size <- colSums(y.liver$counts)
+
+# use Ensembl IDs as row names
+rownames(y.liver$counts) <- rownames(y.liver$genes) <- y.liver$genes$genes
+
+# TMM Normalisation
+y.liver <- calcNormFactors(y.liver)
+y.liver$samples
+
+# design matrix
+liver.group <- y.liver$samples$group
+liver.focal <- factor(c(rep('No', 8), 'Yes', 'No', 'Yes', rep('No', 4)), levels = c('No', 'Yes'))
+data.frame(Sample = colnames(y.liver), liver.focal, liver.group)
+
+design.liver <- model.matrix(~liver.focal + liver.group)
+rownames(design.liver) <- colnames(y.liver)
+design.liver
+
+# filter
+dim(y.liver) # number of genes with non-zero counts
+
+keep.liver <- filterByExpr(y.liver, design.liver)
+y.liver <- y.liver[keep.liver,]
+dim(y.liver) # number of genes after filtering
+
+# PCA
+log.base.counts.liver <- cpm(y.liver, prior.count = 1, log = TRUE, normalized.lib.sizes = TRUE) 
+
+pca.n.liver = prcomp(t(log.base.counts.liver))
+scores.n.liver  = as.data.frame(pca.n.liver$x)
+attach(scores.n.liver)
+
+var.capn.liver = summary(pca.n.liver)
+pc_var.capn.liver = round(var.capn.liver$importance[2,]*100, 1)
+cum_var.capn.liver = round(var.capn.liver$importance[3,]*100, 1)
+sample.ids.liver <- colnames(liver.counts[,-1])
+
+library(ggplot2)
+library(ggdendro)
+library(reshape2)
+
+pca_plot.liver <- scores.n.liver[,1:2]
+pca_plot.liver$sample <- rownames(pca_plot.liver)
+pca_plot.liver$group <- y.liver$samples$group
+
+# modify focal renal
+pca_plot.liver$group <- ifelse(grepl('FIP', pca_plot.liver$group), ifelse(grepl('fip_142|fip_192', pca_plot.liver$sample), 'FIP (focal renal)', 'FIP'), 'Control')
+
+library(ggrepel)
+
+pca.liver.gg <- ggplot(pca_plot.liver, aes(PC1, PC2, fill = group)) +
+  geom_point(shape = 21, size = 4, show.legend = F) +
+  geom_text_repel(aes(x = PC1, y = PC2, label = sample, color = group), max.overlaps = 20, show.legend = F) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_y_continuous(limits = c(-100, 150), breaks = seq(-100, 150, 50)) +
+  scale_x_continuous(limits = c(-100, 200), breaks = seq(-100, 200, 50)) +
+  geom_hline(linetype = 3, yintercept = 0) +
+  geom_vline(linetype = 3, xintercept = 0) +
+  labs(x = paste('PC1: ', pc_var.capn.liver[1], sep = '', '% of variance'), y = paste('PC2: ', pc_var.capn.liver[2], sep = '', '% of variance'), color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# estimate dispersion
+y.liver <- estimateDisp(y.liver, design.liver, robust = TRUE)
+y.liver$common.dispersion
+plotBCV(y.liver)
+
+# fit glms
+fit.liver <- glmFit(y.liver, design.liver)
+lrt.liver <- glmLRT(fit.liver)
+topTags(lrt.liver)
+
+tt.liver <- topTags(lrt.liver, n = nrow(lrt.liver), adjust.method = 'BH')
+all_genes.liver <- tt.liver$table
+
+# add gene symbols from Ensembl
+library(biomaRt)
+
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "fcatus_gene_ensembl")
+symbols.liver <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+                 filters = 'ensembl_gene_id',
+                 values = lrt.liver$genes$genes,
+                 mart = ensembl)
+
+all_genes.liver <- merge(all_genes.liver, symbols.liver, by.x = 'genes', by.y = 'ensembl_gene_id', all.x = TRUE)
+
+deg.liver <- subset(all_genes.liver, FDR < 0.05)
+```
+
+### Lung FIP vs Control
+
+```{r lung_degs}
+lung.counts <- subset(counts, select = c(1, grep('lung', colnames(counts))))
+
+# make dgelist
+y.lung <- DGEList(counts = lung.counts[,-c(1)], genes = lung.counts$Gene, remove.zeros = TRUE)
+
+y.lung$samples$group <- factor(c(rep('Control', length(grep('control', rownames(y.lung$samples)))), rep('FIP', length(grep('fip', rownames(y.lung$samples))))), levels = c('Control', 'FIP'))
+
+# recalculate library sizes
+y.lung$samples$lib.size <- colSums(y.lung$counts)
+
+# use Ensembl IDs as row names
+rownames(y.lung$counts) <- rownames(y.lung$genes) <- y.lung$genes$genes
+
+# TMM Normalisation
+y.lung <- calcNormFactors(y.lung)
+y.lung$samples
+
+# design matrix
+lung.group <- y.lung$samples$group
+lung.focal <- factor(c(rep('No', 7), 'Yes', 'No', 'Yes', rep('No', 2)), levels = c('No', 'Yes'))
+data.frame(Sample = colnames(y.lung), lung.focal, lung.group)
+
+design.lung <- model.matrix(~lung.focal + lung.group)
+rownames(design.lung) <- colnames(y.lung)
+design.lung
+
+# filter
+dim(y.lung) # number of genes with non-zero counts
+
+keep.lung <- filterByExpr(y.lung, design.lung)
+y.lung <- y.lung[keep.lung,]
+dim(y.lung) # number of genes after filtering
+
+# PCA
+log.base.counts.lung <- cpm(y.lung, prior.count = 1, log = TRUE, normalized.lib.sizes = TRUE) 
+
+pca.n.lung = prcomp(t(log.base.counts.lung))
+scores.n.lung  = as.data.frame(pca.n.lung$x)
+attach(scores.n.lung)
+
+var.capn.lung = summary(pca.n.lung)
+pc_var.capn.lung = round(var.capn.lung$importance[2,]*100, 1)
+cum_var.capn.lung = round(var.capn.lung$importance[3,]*100, 1)
+sample.ids.lung <- colnames(lung.counts[,-1])
+
+library(ggplot2)
+library(ggdendro)
+library(reshape2)
+
+pca_plot.lung <- scores.n.lung[,1:2]
+pca_plot.lung$sample <- rownames(pca_plot.lung)
+pca_plot.lung$group <- y.lung$samples$group
+
+# modify focal renal
+pca_plot.lung$group <- ifelse(grepl('FIP', pca_plot.lung$group), ifelse(grepl('fip_142|fip_192', pca_plot.lung$sample), 'FIP (focal renal)', 'FIP'), 'Control')
+
+library(ggrepel)
+
+pca.lung.gg <- ggplot(pca_plot.lung, aes(PC1, PC2, fill = group)) +
+  geom_point(shape = 21, size = 4, show.legend = F) +
+  geom_text_repel(aes(x = PC1, y = PC2, label = sample, color = group), max.overlaps = 20, show.legend = F) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_y_continuous(limits = c(-100, 150), breaks = seq(-100, 150, 50)) +
+  scale_x_continuous(limits = c(-100, 200), breaks = seq(-100, 200, 50)) +
+  geom_hline(linetype = 3, yintercept = 0) +
+  geom_vline(linetype = 3, xintercept = 0) +
+  labs(x = paste('PC1: ', pc_var.capn.lung[1], sep = '', '% of variance'), y = paste('PC2: ', pc_var.capn.lung[2], sep = '', '% of variance'), color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# estimate dispersion
+y.lung <- estimateDisp(y.lung, design.lung, robust = TRUE)
+y.lung$common.dispersion
+plotBCV(y.lung)
+
+# fit glms
+fit.lung <- glmFit(y.lung, design.lung)
+lrt.lung <- glmLRT(fit.lung)
+topTags(lrt.lung)
+
+tt.lung <- topTags(lrt.lung, n = nrow(lrt.lung), adjust.method = 'BH')
+all_genes.lung <- tt.lung$table
+
+# add gene symbols from Ensembl
+library(biomaRt)
+
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "fcatus_gene_ensembl")
+symbols.lung <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+                 filters = 'ensembl_gene_id',
+                 values = lrt.lung$genes$genes,
+                 mart = ensembl)
+
+all_genes.lung <- merge(all_genes.lung, symbols.lung, by.x = 'genes', by.y = 'ensembl_gene_id', all.x = TRUE)
+
+deg.lung <- subset(all_genes.lung, FDR < 0.05)
+```
+
+### MLN FIP vs Control
+
+```{r mln_degs}
+mln.counts <- subset(counts, select = c(1, grep('mln', colnames(counts))))
+
+# make dgelist
+y.mln <- DGEList(counts = mln.counts[,-c(1)], genes = mln.counts$Gene, remove.zeros = TRUE)
+
+y.mln$samples$group <- factor(c(rep('Control', length(grep('control', rownames(y.mln$samples)))), rep('FIP', length(grep('fip', rownames(y.mln$samples))))), levels = c('Control', 'FIP'))
+
+# recalculate library sizes
+y.mln$samples$lib.size <- colSums(y.mln$counts)
+
+# use Ensembl IDs as row names
+rownames(y.mln$counts) <- rownames(y.mln$genes) <- y.mln$genes$genes
+
+# TMM Normalisation
+y.mln <- calcNormFactors(y.mln)
+y.mln$samples
+
+# design matrix
+mln.group <- y.mln$samples$group
+mln.focal <- factor(c(rep('No', 8), 'Yes', 'No', 'Yes', rep('No', 4)), levels = c('No', 'Yes'))
+data.frame(Sample = colnames(y.mln), mln.focal, mln.group)
+
+design.mln <- model.matrix(~mln.focal + mln.group)
+rownames(design.mln) <- colnames(y.mln)
+design.mln
+
+# filter
+dim(y.mln) # number of genes with non-zero counts
+
+keep.mln <- filterByExpr(y.mln, design.mln)
+y.mln <- y.mln[keep.mln,]
+dim(y.mln) # number of genes after filtering
+
+# PCA
+log.base.counts.mln <- cpm(y.mln, prior.count = 1, log = TRUE, normalized.lib.sizes = TRUE) 
+
+pca.n.mln = prcomp(t(log.base.counts.mln))
+scores.n.mln  = as.data.frame(pca.n.mln$x)
+attach(scores.n.mln)
+
+var.capn.mln = summary(pca.n.mln)
+pc_var.capn.mln = round(var.capn.mln$importance[2,]*100, 1)
+cum_var.capn.mln = round(var.capn.mln$importance[3,]*100, 1)
+sample.ids.mln <- colnames(mln.counts[,-1])
+
+library(ggplot2)
+library(ggdendro)
+library(reshape2)
+
+pca_plot.mln <- scores.n.mln[,1:2]
+pca_plot.mln$sample <- rownames(pca_plot.mln)
+pca_plot.mln$group <- y.mln$samples$group
+
+# modify focal renal
+pca_plot.mln$group <- ifelse(grepl('FIP', pca_plot.mln$group), ifelse(grepl('fip_142|fip_192', pca_plot.mln$sample), 'FIP (focal renal)', 'FIP'), 'Control')
+
+library(ggrepel)
+
+pca.mln.gg <- ggplot(pca_plot.mln, aes(PC1, PC2, fill = group)) +
+  geom_point(shape = 21, size = 4, show.legend = F) +
+  geom_text_repel(aes(x = PC1, y = PC2, label = sample, color = group), max.overlaps = 20, show.legend = F) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_y_continuous(limits = c(-100, 150), breaks = seq(-100, 150, 50)) +
+  scale_x_continuous(limits = c(-100, 200), breaks = seq(-100, 200, 50)) +
+  geom_hline(linetype = 3, yintercept = 0) +
+  geom_vline(linetype = 3, xintercept = 0) +
+  labs(x = paste('PC1: ', pc_var.capn.mln[1], sep = '', '% of variance'), y = paste('PC2: ', pc_var.capn.mln[2], sep = '', '% of variance'), color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# estimate dispersion
+y.mln <- estimateDisp(y.mln, design.mln, robust = TRUE)
+y.mln$common.dispersion
+plotBCV(y.mln)
+
+# fit glms
+fit.mln <- glmFit(y.mln, design.mln)
+lrt.mln <- glmLRT(fit.mln)
+topTags(lrt.mln)
+
+tt.mln <- topTags(lrt.mln, n = nrow(lrt.mln), adjust.method = 'BH')
+all_genes.mln <- tt.mln$table
+
+# add gene symbols from Ensembl
+library(biomaRt)
+
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "fcatus_gene_ensembl")
+symbols.mln <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+                 filters = 'ensembl_gene_id',
+                 values = lrt.mln$genes$genes,
+                 mart = ensembl)
+
+all_genes.mln <- merge(all_genes.mln, symbols.mln, by.x = 'genes', by.y = 'ensembl_gene_id', all.x = TRUE)
+
+deg.mln <- subset(all_genes.mln, FDR < 0.05)
+```
+
+## Plot DEGs - all tissues
+
+```{r degs_alltissues}
+# assemble dataframe of logFCs for all tissues
+# liver
+logfc.liver <- subset(all_genes.liver, select = c(genes, logFC, FDR))
+logfc.liver$tissue <- 'Liver'
+
+# lung
+logfc.lung <- subset(all_genes.lung, select = c(genes, logFC, FDR))
+logfc.lung$tissue <- 'Lung'
+
+# MLN
+logfc.mln <- subset(all_genes.mln, select = c(genes, logFC, FDR))
+logfc.mln$tissue <- 'MLN'
+
+# combine
+logfc.all <- rbind(logfc.liver, logfc.lung, logfc.mln)
+logfc.all$tissue <- factor(logfc.all$tissue, levels = rev(c('Liver', 'Lung', 'MLN')))
+
+# plot
+library(ggplot2)
+
+ggplot(logfc.all, aes(logFC, tissue)) +
+  geom_jitter(data = logfc.all[logfc.all$FDR >= 0.05,], aes(logFC, tissue), color = '#878787', size = 1, height = 0.3) +
+  geom_jitter(data = logfc.all[logfc.all$FDR < 0.05 & logfc.all$logFC > 0,], aes(logFC, tissue), color = '#B02223', size = 1, height = 0.3) +
+  geom_jitter(data = logfc.all[logfc.all$FDR < 0.05 & logfc.all$logFC < 0,], aes(logFC, tissue), color = '#3162A7', size = 1, height = 0.3) +
+  geom_vline(xintercept = c(-1,1), color = 'black', lty = 'dashed') +
+  scale_x_continuous(limits = c(-12,12), breaks = seq(-14,14,2)) +
+  labs(x = expression(log[2]*' fold change'), y = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Intersect DEGs - all tissues
+
+```{r degs_intersection}
+library(UpSetR)
+
+# upset plot of genes upregulated in FIP in each tissue
+fip.up.list <- list(Liver = deg.liver[deg.liver$logFC > 0,]$genes, 
+                    Lung = deg.lung[deg.lung$logFC > 0,]$genes,
+                    MLN = deg.mln[deg.mln$logFC > 0,]$genes)
+
+upset(fromList(fip.up.list), sets.bar.color = c('#EA8131','#033BF4','#5EC64F'))
+
+# plot fold changes of interferon stimulated genes upregulated in FIP in all tissues
+# DEGs filtered for genes in interferome 2.0 database (http://interferome.its.monash.edu.au/interferome/)
+library(reshape2)
+library(ggplot2)
+
+shared <- read.csv('shared_degs_interferome_foldchanges.txt', sep = '\t', header = TRUE)
+
+# order by MLN fold change
+shared <- shared[order(shared$MLN, decreasing = TRUE),]
+shared$Symbol <- factor(shared$Symbol, levels = shared$Symbol)
+
+shared.melt <- melt(shared, id.vars = c('Gene', 'Symbol'))
+shared.melt$variable <- factor(shared.melt$variable, levels = c('Liver', 'Lung', 'MLN'))
+
+ggplot(shared.melt, aes(Symbol, value, color = variable)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,8), breaks = seq(0,8,1)) +
+  labs(x = '', y = expression(log[2]*' fold change'), color = '') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Gene Set Enrichment Analysis (GSEA)
+
+```{r gsea_preparedata}
+# prepare edgeR normalised counts for each tissue and export
+liver.norm <- cpm(y.liver, log = TRUE, normalized.lib.sizes = TRUE)
+write.table(liver.norm, file = 'liver_norm_counts_edger_forGSEA.txt', sep = '\t', quote = FALSE)
+
+lung.norm <- cpm(y.lung, log = TRUE, normalized.lib.sizes = TRUE)
+write.table(lung.norm, file = 'lung_norm_counts_edger_forGSEA.txt', sep = '\t', quote = FALSE)
+
+mln.norm <- cpm(y.mln, log = TRUE, normalized.lib.sizes = TRUE)
+write.table(mln.norm, file = 'mln_norm_counts_edger_forGSEA.txt', sep = '\t', quote = FALSE)
+
+# prepare feline Hallmark gene sets in GMT format (https://docs.gsea-msigdb.org/#GSEA/Data_Formats/#gmt-gene-matrix-transposed-file-format-gmt)
+library(msigdbr)
+
+h_df <- msigdbr(species = 'Felis catus', category = 'H') %>%
+  dplyr::select(gs_name, ensembl_gene)
+
+gmt_lines <- sapply(
+  split(h_df$ensembl_gene, h_df$gs_name),
+  function(genes) paste(unique(genes), collapse = "\t")
+)
+
+gmt_lines <- paste(names(gmt_lines), "na", gmt_lines, sep = "\t")
+writeLines(gmt_lines, "feline_hallmark_genesets.gmt")
+```
+
+GSEA was performed using the desktop GSEA app (v4.3.2) from the Broad institute (https://www.gsea-msigdb.org/gsea/index.jsp). 
+
+Results were exported and replotted using the below function, adapted from https://github.com/PeeperLab/Rtoolbox/blob/master/R/ReplotGSEA.R. 
+
+```{r replotGSEA}
+## Script by Thomas Kuilman accessed 10-08-23 https://github.com/PeeperLab/Rtoolbox/blob/master/R/ReplotGSEA.R
+## path argument: path to output folder of analysis (e.g. PATH/my_analysis.GseaPreranked.1470948568349)
+## gene.set argument: name of the gene set (e.g. V$AP1_Q2).
+## It is used in a grep command, so multiple matching is possible.
+## Also, R regular expressions can be handled, e.g. "IL2[0-9]$"
+## Leading "V$" from gene set names are stripped to allow using the grep command.
+## In case of multiple grep matches a warning is given and the first option is plotted.
+## class.name: the name of the class / variable to which genes have been correlated (e.g. drug-treatment)
+## metric.range: the range of the metric; defaults to [min(DEFINED RANGE), max(DEFINED RANGE)]
+## enrichment.score.range: the range of the enrichment score; defaults to [min(ENRICHMENT SCORE), max(ENRICHMENT SCORE)]
+
+replotGSEA <- function(path, gene.set, class.name, metric.range,
+                       enrichment.score.range) {
+  
+  if (missing(path)) {
+    stop("Path argument is required")
+  }
+  if (!file.exists(path)) {
+    stop("The path folder could not be found. Please change the path")
+  }
+  if (missing(gene.set)) {
+    stop("Gene set argument is required")
+  }
+  
+  ## Load .rnk data
+  path.rnk <- list.files(path = file.path(path, "edb"),
+                         pattern = ".rnk$", full.names = TRUE)
+  gsea.rnk <- read.delim(file = path.rnk, header = FALSE)
+  colnames(gsea.rnk) <- c("hgnc.symbol", "metric")
+  if (missing(metric.range)) {
+    metric.range <- c(min(gsea.rnk$metric), max(gsea.rnk$metric))
+  }  
+  
+  ## Load .edb data
+  path.edb <- list.files(path = file.path(path, "edb"),
+                         pattern = ".edb$", full.names = TRUE)
+  gsea.edb <- read.delim(file = path.edb,
+                         header = FALSE, stringsAsFactors = FALSE)
+  gsea.edb <- unlist(gsea.edb)
+  gsea.metric <- gsea.edb[grep("METRIC=", gsea.edb)]
+  gsea.metric <- unlist(strsplit(gsea.metric, " "))
+  gsea.metric <- gsea.metric[grep("METRIC=", gsea.metric)]
+  gsea.metric <- gsub("METRIC=", "", gsea.metric)
+  gsea.edb <- gsea.edb[grep("<DTG", gsea.edb)]
+  
+  # Select the right gene set
+  if (length(gsea.edb) == 0) {
+    stop(paste("The gene set name was not found, please provide",
+               "a correct name"))
+  }
+  if (length(grep(paste0(gsub(".\\$(.*$)", "\\1", gene.set), " "), gsea.edb)) > 1) {
+    warning(paste("More than 1 gene set matched the gene.set",
+                  "argument; the first match is plotted"))
+  }
+  gsea.edb <- gsea.edb[grep(paste0(gsub(".\\$(.*$)", "\\1", gene.set), " "), gsea.edb)[1]]
+  
+  # Get template name
+  gsea.edb <- gsub(".*TEMPLATE=(.*)", "\\1", gsea.edb)
+  gsea.edb <- unlist(strsplit(gsea.edb, " "))
+  gsea.template <- gsea.edb[1]
+  
+  # Get gene set name
+  gsea.gene.set <- gsea.edb[2]
+  gsea.gene.set <- gsub("GENESET=gene_sets.gmt#", "", gsea.gene.set)
+  
+  # Get enrichment score
+  gsea.enrichment.score <- gsea.edb[3]
+  gsea.enrichment.score <- gsub("ES=", "", gsea.enrichment.score)
+  
+  # Get gene set name
+  gsea.normalized.enrichment.score <- gsea.edb[4]
+  gsea.normalized.enrichment.score <- gsub("NES=", "",
+                                           gsea.normalized.enrichment.score)
+  
+  # Get nominal p-value
+  gsea.p.value <- gsea.edb[5]
+  gsea.p.value <- gsub("NP=", "", gsea.p.value)
+  gsea.p.value <- as.numeric(gsea.p.value)
+  
+  # Get FDR
+  gsea.fdr <- gsea.edb[6]
+  gsea.fdr <- gsub("FDR=", "", gsea.fdr)
+  gsea.fdr <- as.numeric(gsea.fdr)
+  
+  # Get hit indices
+  gsea.edb <- gsea.edb[grep("HIT_INDICES=", gsea.edb):length(gsea.edb)]
+  gsea.hit.indices <- gsea.edb[seq_len(grep("ES_PROFILE=", gsea.edb) - 1)]
+  gsea.hit.indices <- gsub("HIT_INDICES=", "", gsea.hit.indices)
+  gsea.hit.indices <- as.integer(gsea.hit.indices)
+  
+  # Get ES profile
+  gsea.edb <- gsea.edb[grep("ES_PROFILE=", gsea.edb):length(gsea.edb)]
+  gsea.es.profile <- gsea.edb[seq_len(grep("RANK_AT_ES=", gsea.edb) - 1)]
+  gsea.es.profile <- gsub("ES_PROFILE=", "", gsea.es.profile)
+  gsea.es.profile <- as.numeric(gsea.es.profile)
+  
+  # Set enrichment score range
+  if (missing(enrichment.score.range)) {
+    enrichment.score.range <- c(min(gsea.es.profile), max(gsea.es.profile))
+  }
+  
+  
+  ## Create GSEA plot
+  # Save default for resetting
+  def.par <- par(no.readonly = TRUE)
+  
+  # Create a new device of appropriate size
+  dev.new(width = 3, height = 3)
+  
+  # Create a division of the device
+  gsea.layout <- layout(matrix(c(1, 2, 3, 4)), heights = c(1.7, 0.5, 0.2, 2))
+  layout.show(gsea.layout)
+  
+  # Create plots
+  par(mar = c(0, 5, 2, 2))
+  plot(c(1, gsea.hit.indices, length(gsea.rnk$metric)),
+       c(0, gsea.es.profile, 0), type = "l", col = "red", lwd = 1.5, xaxt = "n",
+       xaxs = "i", xlab = "", ylab = "Enrichment score (ES)",
+       ylim = enrichment.score.range,
+       main = list(gsea.gene.set, font = 1, cex = 1),
+       panel.first = {
+         abline(h = seq(round(enrichment.score.range[1], digits = 1),
+                        enrichment.score.range[2], 0.1),
+                col = "gray95", lty = 2)
+         abline(h = 0, col = "gray50", lty = 2)
+       })
+  plot.coordinates <- par("usr")
+  if(gsea.enrichment.score < 0) {
+    text(length(gsea.rnk$metric) * 0.01, plot.coordinates[3] * 0.98,
+         paste("Nominal p-value:", gsea.p.value, "\nFDR:", gsea.fdr, "\nES:",
+               gsea.enrichment.score, "\nNormalized ES:",
+               gsea.normalized.enrichment.score), adj = c(0, 0))
+  } else {
+    text(length(gsea.rnk$metric) * 0.99, plot.coordinates[4] - ((plot.coordinates[4] - plot.coordinates[3]) * 0.03),
+         paste("Nominal p-value:", gsea.p.value, "\nFDR:", gsea.fdr, "\nES:",
+               gsea.enrichment.score, "\nNormalized ES:",
+               gsea.normalized.enrichment.score, "\n"), adj = c(1, 1))
+  }
+  
+  par(mar = c(0, 5, 0, 2))
+  plot(0, type = "n", xaxt = "n", xaxs = "i", xlab = "", yaxt = "n",
+       ylab = "", xlim = c(1, length(gsea.rnk$metric)))
+  abline(v = gsea.hit.indices, lwd = 0.75)
+  
+  par(mar = c(0, 5, 0, 2))
+  rank.colors <- gsea.rnk$metric - metric.range[1]
+  rank.colors <- rank.colors / (metric.range[2] - metric.range[1])
+  rank.colors <- ceiling(rank.colors * 255 + 1)
+  tryCatch({
+    rank.colors <- colorRampPalette(c("blue", "white", "red"))(256)[rank.colors]
+  }, error = function(e) {
+    stop("Please use the metric.range argument to provide a metric range that",
+         "includes all metric values")
+  })
+  # Use rle to prevent too many objects
+  rank.colors <- rle(rank.colors)
+  barplot(matrix(rank.colors$lengths), col = rank.colors$values, border = NA, horiz = TRUE, xaxt = "n", xlim = c(1, length(gsea.rnk$metric)))
+  box()
+  text(length(gsea.rnk$metric) / 2, 0.7,
+       labels = ifelse(!missing(class.name), class.name, gsea.template))
+  text(length(gsea.rnk$metric) * 0.01, 0.7, "Positive", adj = c(0, NA))
+  text(length(gsea.rnk$metric) * 0.99, 0.7, "Negative", adj = c(1, NA))
+  
+  par(mar = c(5, 5, 0, 2))
+  rank.metric <- rle(round(gsea.rnk$metric, digits = 2))
+  plot(gsea.rnk$metric, type = "n", xaxs = "i",
+       xlab = "Rank in ordered gene list", xlim = c(0, length(gsea.rnk$metric)),
+       ylim = metric.range, yaxs = "i",
+       ylab = if(gsea.metric == "None") {"Ranking metric"} else {gsea.metric},
+       panel.first = abline(h = seq(metric.range[1] / 2,
+                                    metric.range[2] - metric.range[1] / 4,
+                                    metric.range[2] / 2), col = "gray95", lty = 2))
+  
+  barplot(rank.metric$values, col = "lightgrey", lwd = 0.1, xaxs = "i",
+          xlab = "Rank in ordered gene list", xlim = c(0, length(gsea.rnk$metric)),
+          ylim = c(-1, 1), yaxs = "i", width = rank.metric$lengths, border = NA,
+          ylab = ifelse(gsea.metric == "None", "Ranking metric", gsea.metric), space = 0, add = TRUE)
+  box()
+  
+  # Reset to default
+  par(def.par)
+  
+}
+```
+
+```{r gsea_plots}
+# Liver
+# plot summary of all significant (FDR<0.05) gene sets
+liver.gsea.sets <- read.csv('gsea_sigsets_liver.txt', sep = '\t', header = TRUE)
+liver.gsea.sets <- liver.gsea.sets[order(liver.gsea.sets$NES, decreasing = TRUE),]
+liver.gsea.sets$NAME <- factor(liver.gsea.sets$NAME, levels = rev(liver.gsea.sets$NAME))
+liver.gsea.sets$group <- c(rep('FIP', 9), rep('Control', 7))
+
+library(ggplot2)
+
+liver.gsea.gg <- ggplot(liver.gsea.sets, aes(NES, NAME, fill = group)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'black') +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_x_continuous(limits = c(-3.2,3.2), breaks = seq(-3,3,1)) +
+  labs(x = 'Normalised enrichment score (NES)', y = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot interferon alpha response gene set using ReplotGSEA
+liver.gsea.ifna <- replotGSEA(path = 'liver_genesetperm.Gsea.runID',
+                              gene.set = 'HALLMARK_INTERFERON_ALPHA_RESPONSE', 
+                              class.name = 'Group',
+                              metric.range = c(-2,2))
+
+# Lung
+# plot summary of all significant (FDR<0.05) gene sets
+lung.gsea.sets <- read.csv('gsea_sigsets_lung.txt', sep = '\t', header = TRUE)
+lung.gsea.sets <- lung.gsea.sets[order(lung.gsea.sets$NES, decreasing = TRUE),]
+lung.gsea.sets$NAME <- factor(lung.gsea.sets$NAME, levels = rev(lung.gsea.sets$NAME))
+lung.gsea.sets$group <- c(rep('FIP', 2), rep('Control', 25))
+
+library(ggplot2)
+
+lung.gsea.gg <- ggplot(lung.gsea.sets, aes(NES, NAME, fill = group)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'black') +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_x_continuous(limits = c(-3.2,3.2), breaks = seq(-3,3,1)) +
+  labs(x = 'Normalised enrichment score (NES)', y = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot interferon alpha response gene set using ReplotGSEA
+lung.gsea.ifna <- replotGSEA(path = 'lung_genesetperm.Gsea.runID',
+                             gene.set = 'HALLMARK_INTERFERON_ALPHA_RESPONSE', 
+                             class.name = 'Group',
+                             metric.range = c(-2,2))
+
+# MLN
+# plot summary of all significant (FDR<0.05) gene sets
+mln.gsea.sets <- read.csv('gsea_sigsets_mln.txt', sep = '\t', header = TRUE)
+mln.gsea.sets <- mln.gsea.sets[order(mln.gsea.sets$NES, decreasing = TRUE),]
+mln.gsea.sets$NAME <- factor(mln.gsea.sets$NAME, levels = rev(mln.gsea.sets$NAME))
+mln.gsea.sets$group <- c(rep('FIP', 13), rep('Control', 3))
+
+library(ggplot2)
+
+mln.gsea.gg <- ggplot(mln.gsea.sets, aes(NES, NAME, fill = group)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, lty = 'dashed', color = 'black') +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_x_continuous(limits = c(-3.2,3.2), breaks = seq(-3,3,1)) +
+  labs(x = 'Normalised enrichment score (NES)', y = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot interferon alpha response gene set using ReplotGSEA
+mln.gsea.ifna <- replotGSEA(path = 'mln_genesetperm.Gsea.runID',
+                            gene.set = 'HALLMARK_INTERFERON_ALPHA_RESPONSE', 
+                            class.name = 'Group',
+                            metric.range = c(-2,2))
+```
+
+## Gene Ontology (GO) Enrichment Analysis
+
+```{r go_enrich}
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(msigdbr)
+
+# get feline GO:BP gene sets from msigdbr
+go_df <- msigdbr(species = 'Felis catus', category = 'C5', subcategory = 'BP') %>%
+  dplyr::select(gs_name, ensembl_gene)
+
+# use the compareCluster function from clusterProfiler to compare GO enrichment for DEG lists from all tissues
+# higher in FIP
+up.go <- compareCluster(fip.up.list, fun = 'enricher', TERM2GENE = go_df)
+
+# define selected significant adaptive immune response terms
+adaptive.terms <- c("GOBP_T_CELL_ACTIVATION",
+                    "GOBP_CD4_POSITIVE_ALPHA_BETA_T_CELL_ACTIVATION",
+                    "GOBP_CD4_POSITIVE_ALPHA_BETA_T_CELL_DIFFERENTIATION",
+                    "GOBP_T_CELL_MEDIATED_IMMUNITY",
+                    "GOBP_B_CELL_MEDIATED_IMMUNITY",
+                    "GOBP_HUMORAL_IMMUNE_RESPONSE",
+                    "GOBP_ADAPTIVE_IMMUNE_RESPONSE",
+                    "GOBP_ADAPTIVE_IMMUNE_RESPONSE_BASED_ON_SOMATIC_RECOMBINATION_OF_IMMUNE_RECEPTORS_BUILT_FROM_IMMUNOGLOBULIN_SUPERFAMILY_DOMAINS")
+adaptive.terms <- factor(adaptive.terms, levels = adaptive.terms)
+
+# plot
+options(enrichplot.colours = viridis::mako(5)[2:5])
+
+dotplot(up.go, showCategory = adaptive.terms, font.size = 10, by = 'count') +
+  theme(panel.grid = element_blank())
+```
+
+## DEG heatmaps
+
+```{r deg_hmaps}
+# hmaps of normalised expression for selected genes shown in figure 2 of the manuscript
+# interferon stimulated genes - selected from DEGs upregulated in FIP in all tissues, and not overlapping the cytokines/chemokines or adaptive immune response gene sets
+ifn.hmap.genes <- data.frame(gene = c("ENSFCAG00000032098","ENSFCAG00000035139","ENSFCAG00000045013","ENSFCAG00000044201","ENSFCAG00000011892",
+                                      "ENSFCAG00000009641","ENSFCAG00000000318","ENSFCAG00000008068","ENSFCAG00000008727","ENSFCAG00000030232",
+                                      "ENSFCAG00000001294","ENSFCAG00000007421","ENSFCAG00000023951","ENSFCAG00000002145","ENSFCAG00000022513",
+                                      "ENSFCAG00000022349","ENSFCAG00000029344","ENSFCAG00000000945","ENSFCAG00000002745","ENSFCAG00000000928"),
+                             symbol = c("ISG15","RSAD2","IFIT3","IFIT1","UPP1","OASL","OAS1","MX1","HERC6","USP18",
+                                        "RIGI","IFIT5","IFIH1","DHX58","CMPK2","IFI44","SAMD9L","RNF213","TDRD7","DTX3L")
+)
+
+# cytokines/chemokines - selected from top DEGs in FIP in mesenteric lymph node
+cytokine.hmap.genes <- data.frame(gene = c("ENSFCAG00000046651","ENSFCAG00000004604","ENSFCAG00000044935","ENSFCAG00000009014","ENSFCAG00000008095",
+                                           "ENSFCAG00000005899","ENSFCAG00000009165","ENSFCAG00000005638","ENSFCAG00000012295","ENSFCAG00000033485",
+                                           "ENSFCAG00000032292","ENSFCAG00000014969","ENSFCAG00000004666","ENSFCAG00000041612","ENSFCAG00000042149",
+                                           "ENSFCAG00000039100","ENSFCAG00000038488","ENSFCAG00000045217","ENSFCAG00000013594","ENSFCAG00000040124"),
+                                  symbol = c("IFNA7","IFNB1","IFNW12","IFNG","IL1A","IL1B","IL6","IL11","IL27","IL17A",
+                                             "LIF","CXCL6","CXCL8","CXCL9","CXCL10","CXCL11","CCL2","CCL7","CCL8","CSF3")
+)
+
+# adaptive immune response - selected from 
+adaptive.hmap.genes <- data.frame(gene = c("ENSFCAG00000000175","ENSFCAG00000038245","ENSFCAG00000000645","ENSFCAG00000009047","ENSFCAG00000003636",
+                                           "ENSFCAG00000002776","ENSFCAG00000007357","ENSFCAG00000028588","ENSFCAG00000023547","ENSFCAG00000009431",
+                                           "ENSFCAG00000001034","ENSFCAG00000003581","ENSFCAG00000008135","ENSFCAG00000008757","ENSFCAG00000009585",
+                                           "ENSFCAG00000008716","ENSFCAG00000012230","ENSFCAG00000014287","ENSFCAG00000018768","ENSFCAG00000042806"),
+                                  symbol = c("C1S","C2","C5","CD274","IDO1","TREM1","TNFRSF21","JAK2","MDK","ICAM1",
+                                             "FCGR3A","RNF19B","TNFAIP3","ZC3H12A","CD80","CD86","B2M","PDCD1","RIPK2","TAP1")
+)
+
+# heatmaps for gene sets in MLN samples
+library(pheatmap)
+library(RColorBrewer)
+
+breaks = seq(-2, 2, 0.1)
+hmcols = colorRampPalette(c('#3162A7', '#5DB7E7', '#C8D7D6', '#FAB31E', '#B02223'))(length(breaks))
+
+# set column/sample order
+mln.col.order <- c('control_54_mln', 'control_69_mln', 'control_135_mln', 'control_136_mln', 'control_164_mln', 'control_174_mln', 'control_188_mln', 'fip_37_mln', 'fip_68_mln', 'fip_86_mln', 'fip_96_mln', 'fip_120_mln', 'fip_172_mln', 'fip_142_mln', 'fip_192_mln')
+
+# interferon stimulated genes
+hmap_ifn.mln <- cpm(y.mln$counts, log = TRUE, prior.count = 1)[match(ifn.hmap.genes$gene, 
+                                                                           rownames(cpm(y.mln$counts, log = TRUE, prior.count = 1))),]
+
+hmap_ifn.mln <- as.data.frame(hmap_ifn.mln[,mln.col.order])
+
+# replace IDs with symbols
+hmap_ifn.mln$gene <- rownames(hmap_ifn.mln)
+hmap_ifn.mln$id <- 1:nrow(hmap_ifn.mln)
+hmap_ifn.mln <- merge(hmap_ifn.mln, ifn.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_ifn.mln <- hmap_ifn.mln[order(hmap_ifn.mln$id, decreasing = FALSE),]
+rownames(hmap_ifn.mln) <- hmap_ifn.mln$symbol
+hmap_ifn.mln$symbol <- NULL
+hmap_ifn.mln$gene <- NULL
+hmap_ifn.mln$id <- NULL
+
+# plot
+pheatmap(hmap_ifn.mln, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# adaptive immune response
+hmap_adaptiveive.mln <- cpm(y.mln$counts, log = TRUE, prior.count = 1)[match(adaptive.hmap.genes$gene, 
+                                                                           rownames(cpm(y.mln$counts, log = TRUE, prior.count = 1))),]
+
+hmap_adaptiveive.mln <- as.data.frame(hmap_adaptive.mln[,mln.col.order])
+
+# replace IDs with symbols
+hmap_adaptive.mln$gene <- rownames(hmap_adaptive.mln)
+hmap_adaptive.mln$id <- 1:nrow(hmap_adaptive.mln)
+hmap_adaptive.mln <- merge(hmap_adaptive.mln, adapt.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_adaptive.mln <- hmap_adaptive.mln[order(hmap_adaptive.mln$id, decreasing = FALSE),]
+rownames(hmap_adaptive.mln) <- hmap_adaptive.mln$symbol
+hmap_adaptive.mln$symbol <- NULL
+hmap_adaptive.mln$gene <- NULL
+hmap_adaptive.mln$id <- NULL
+
+# plot
+pheatmap(hmap_adaptive.mln, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# cytokines/chemokines
+hmap_cytokines.mln <- cpm(y.mln$counts, log = TRUE, prior.count = 1)[match(cytok.hmap.genes$gene, 
+                                                                           rownames(cpm(y.mln$counts, log = TRUE, prior.count = 1))),]
+
+hmap_cytokines.mln <- as.data.frame(hmap_cytokines.mln[,mln.col.order])
+
+# replace IDs with symbols
+hmap_cytokines.mln$gene <- rownames(hmap_cytokines.mln)
+hmap_cytokines.mln$id <- 1:nrow(hmap_cytokines.mln)
+hmap_cytokines.mln <- merge(hmap_cytokines.mln, cytok.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_cytokines.mln <- hmap_cytokines.mln[order(hmap_cytokines.mln$id, decreasing = FALSE),]
+rownames(hmap_cytokines.mln) <- hmap_cytokines.mln$symbol
+hmap_cytokines.mln$symbol <- NULL
+hmap_cytokines.mln$gene <- NULL
+hmap_cytokines.mln$id <- NULL
+
+# plot
+pheatmap(hmap_cytokines.mln, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# heatmaps for gene sets in liver samples
+# set column/sample order
+liver.col.order <- c('control_54_liver', 'control_69_liver', 'control_135_liver', 'control_136_liver', 'control_164_liver', 'control_174_liver', 'control_188_liver', 'fip_37_liver', 'fip_68_liver', 'fip_86_liver', 'fip_96_liver', 'fip_120_liver', 'fip_172_liver', 'fip_142_liver', 'fip_192_liver')
+
+# interferon stimulated genes
+hmap_ifn.liver <- cpm(y.liver$counts, log = TRUE, prior.count = 1)[match(ifn.hmap.genes$gene, 
+                                                                           rownames(cpm(y.liver$counts, log = TRUE, prior.count = 1))),]
+
+hmap_ifn.liver <- as.data.frame(hmap_ifn.liver[,liver.col.order])
+
+# replace IDs with symbols
+hmap_ifn.liver$gene <- rownames(hmap_ifn.liver)
+hmap_ifn.liver$id <- 1:nrow(hmap_ifn.liver)
+hmap_ifn.liver <- merge(hmap_ifn.liver, ifn.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_ifn.liver <- hmap_ifn.liver[order(hmap_ifn.liver$id, decreasing = FALSE),]
+rownames(hmap_ifn.liver) <- hmap_ifn.liver$symbol
+hmap_ifn.liver$symbol <- NULL
+hmap_ifn.liver$gene <- NULL
+hmap_ifn.liver$id <- NULL
+
+# plot
+pheatmap(hmap_ifn.liver, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# adaptive immune response
+hmap_adaptive.liver <- cpm(y.liver$counts, log = TRUE, prior.count = 1)[match(adaptive.hmap.genes$gene, 
+                                                                           rownames(cpm(y.liver$counts, log = TRUE, prior.count = 1))),]
+
+hmap_adaptive.liver <- as.data.frame(hmap_adaptive.liver[,liver.col.order])
+
+# add rownames for missing genes
+rownames(hmap_adaptive.liver) <- adaptive.hmap.genes$gene
+
+# replace IDs with symbols
+hmap_adaptive.liver$gene <- rownames(hmap_adaptive.liver)
+hmap_adaptive.liver$id <- 1:nrow(hmap_adaptive.liver)
+hmap_adaptive.liver <- merge(hmap_adaptive.liver, adapt.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_adaptive.liver <- hmap_adaptive.liver[order(hmap_adaptive.liver$id, decreasing = FALSE),]
+rownames(hmap_adaptive.liver) <- hmap_adaptive.liver$symbol
+hmap_adaptive.liver$symbol <- NULL
+hmap_adaptive.liver$gene <- NULL
+hmap_adaptive.liver$id <- NULL
+
+# plot
+pheatmap(hmap_adaptive.liver, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# cytokines/chemokines
+hmap_cytokines.liver <- cpm(y.liver$counts, log = TRUE, prior.count = 1)[match(cytokine.hmap.genes$gene, 
+                                                                           rownames(cpm(y.liver$counts, log = TRUE, prior.count = 1))),]
+
+hmap_cytokines.liver <- as.data.frame(hmap_cytokines.liver[,liver.col.order])
+
+# add rownames for missing genes
+rownames(hmap_cytokines.liver) <- cytokine.hmap.genes$gene
+
+# replace IDs with symbols
+hmap_cytokines.liver$gene <- rownames(hmap_cytokines.liver)
+hmap_cytokines.liver$id <- 1:nrow(hmap_cytokines.liver)
+hmap_cytokines.liver <- merge(hmap_cytokines.liver, cytokine.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_cytokines.liver <- hmap_cytokines.liver[order(hmap_cytokines.liver$id, decreasing = FALSE),]
+rownames(hmap_cytokines.liver) <- hmap_cytokines.liver$symbol
+hmap_cytokines.liver$symbol <- NULL
+hmap_cytokines.liver$gene <- NULL
+hmap_cytokines.liver$id <- NULL
+
+# plot
+pheatmap(hmap_cytokines.liver, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# heatmaps for gene sets in lung samples
+# set column/sample order
+lung.col.order <- c('control_54_lung', 'control_69_lung', 'control_135_lung', 'control_136_lung', 'control_164_lung', 'control_174_lung', 'control_188_lung', 'fip_68_lung', 'fip_86_lung','fip_172_lung', 'fip_142_lung', 'fip_192_lung')
+
+# interferon stimulated genes
+hmap_ifn.lung <- cpm(y.lung$counts, log = TRUE, prior.count = 1)[match(ifn.hmap.genes$gene, 
+                                                                           rownames(cpm(y.lung$counts, log = TRUE, prior.count = 1))),]
+
+hmap_ifn.lung <- as.data.frame(hmap_ifn.lung[,lung.col.order])
+
+# replace IDs with symbols
+hmap_ifn.lung$gene <- rownames(hmap_ifn.lung)
+hmap_ifn.lung$id <- 1:nrow(hmap_ifn.lung)
+hmap_ifn.lung <- merge(hmap_ifn.lung, ifn.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_ifn.lung <- hmap_ifn.lung[order(hmap_ifn.lung$id, decreasing = FALSE),]
+rownames(hmap_ifn.lung) <- hmap_ifn.lung$symbol
+hmap_ifn.lung$symbol <- NULL
+hmap_ifn.lung$gene <- NULL
+hmap_ifn.lung$id <- NULL
+
+# plot
+pheatmap(hmap_ifn.lung, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# adaptive immune response
+hmap_adaptive.lung <- cpm(y.lung$counts, log = TRUE, prior.count = 1)[match(adaptive.hmap.genes$gene, 
+                                                                           rownames(cpm(y.lung$counts, log = TRUE, prior.count = 1))),]
+
+hmap_adaptive.lung <- as.data.frame(hmap_adaptive.lung[,lung.col.order])
+
+# add rownames for missing genes
+rownames(hmap_adaptive.lung) <- adaptive.hmap.genes$gene
+
+# replace IDs with symbols
+hmap_adaptive.lung$gene <- rownames(hmap_adaptive.lung)
+hmap_adaptive.lung$id <- 1:nrow(hmap_adaptive.lung)
+hmap_adaptive.lung <- merge(hmap_adaptive.lung, adapt.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_adaptive.lung <- hmap_adaptive.lung[order(hmap_adaptive.lung$id, decreasing = FALSE),]
+rownames(hmap_adaptive.lung) <- hmap_adaptive.lung$symbol
+hmap_adaptive.lung$symbol <- NULL
+hmap_adaptive.lung$gene <- NULL
+hmap_adaptive.lung$id <- NULL
+
+# plot
+pheatmap(hmap_adaptive.lung, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+
+# cytokines/chemokines
+hmap_cytokines.lung <- cpm(y.lung$counts, log = TRUE, prior.count = 1)[match(cytokine.hmap.genes$gene, 
+                                                                           rownames(cpm(y.lung$counts, log = TRUE, prior.count = 1))),]
+
+hmap_cytokines.lung <- as.data.frame(hmap_cytokines.lung[,lung.col.order])
+
+# add rownames for missing genes
+rownames(hmap_cytokines.lung) <- cytokine.hmap.genes$gene
+
+# replace IDs with symbols
+hmap_cytokines.lung$gene <- rownames(hmap_cytokines.lung)
+hmap_cytokines.lung$id <- 1:nrow(hmap_cytokines.lung)
+hmap_cytokines.lung <- merge(hmap_cytokines.lung, cytokine.hmap.genes, by = 'gene', all.x = TRUE)
+hmap_cytokines.lung <- hmap_cytokines.lung[order(hmap_cytokines.lung$id, decreasing = FALSE),]
+rownames(hmap_cytokines.lung) <- hmap_cytokines.lung$symbol
+hmap_cytokines.lung$symbol <- NULL
+hmap_cytokines.lung$gene <- NULL
+hmap_cytokines.lung$id <- NULL
+
+# plot
+pheatmap(hmap_cytokines.lung, 
+         color = hmcols, 
+         breaks = breaks, 
+         scale = 'row', 
+         show_rownames = TRUE, 
+         annotation_legend = FALSE, 
+         annotation_names_row = FALSE, 
+         angle_col = 45,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         cellheight = 12,
+         cellwidth = 12,
+         gaps_col = 7)
+```
+
+## Gene set scores
+
+```{r geneset_scores}
+library(miscTools)
+library(singscore)
+library(SummarizedExperiment)
+library(ggplot2)
+
+# calculate gene set scores for comparison with FCoV abundance
+# first create summarizedexperiment object using normalised counts
+counts.se <- SummarizedExperiment(assays = list(counts = log.base.counts))
+
+# determine ranks
+rankData <- rankGenes(counts.se)
+
+# interferon stimulated genes
+# calculate scores
+scoredf.ifn <- simpleScore(rankData, upSet = ifn.hmap.genes$gene)
+
+# plots
+scoredf.ifn$group <- c(rep('Control', 21), rep('FIP', 21))
+scoredf.ifn$tissue <- ifelse(grepl('liver', rownames(scoredf.ifn)), 'Liver', ifelse(grepl('lung', rownames(scoredf.ifn)), 'Lung', 'MLN'))
+
+ggplot(scoredf.ifn, aes(group, TotalScore, fill = group)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  facet_wrap(vars(tissue), nrow = 1) +
+  theme_bw()
+
+plotDispersion(scoredf.ifn, annot = scoredf.ifn$group)
+
+# calculate p-values
+permuteResult <-
+  generateNull(
+    upSet = ifn.hmap.genes$Gene,
+    rankData = rankData,
+    centerScore = TRUE,
+    knownDirection = TRUE,
+    B = 10000,
+    ncores = 1,
+    seed = 1,
+    useBPPARAM = NULL
+  )
+
+pvals <- getPvals(permuteResult, scoredf.ifn)
+
+wilcox.test(scoredf.ifn[scoredf.ifn$group == 'Control' & scoredf.ifn$tissue == 'Liver',]$TotalScore, 
+            scoredf.ifn[scoredf.ifn$group == 'FIP' & scoredf.ifn$tissue == 'Liver',]$TotalScore)
+
+wilcox.test(scoredf.ifn[scoredf.ifn$group == 'Control' & scoredf.ifn$tissue == 'Lung',]$TotalScore, 
+            scoredf.ifn[scoredf.ifn$group == 'FIP' & scoredf.ifn$tissue == 'Lung',]$TotalScore)
+
+wilcox.test(scoredf.ifn[scoredf.ifn$group == 'Control' & scoredf.ifn$tissue == 'MLN',]$TotalScore, 
+            scoredf.ifn[scoredf.ifn$group == 'FIP' & scoredf.ifn$tissue == 'MLN',]$TotalScore)
+
+write.table(scoredf.ifn, file = 'interferon_gene_set_scores.txt', sep = '\t', quote = FALSE)
+
+# cytoines/chemokines
+# calculate scores
+scoredf.cytokine <- simpleScore(rankData, upSet = cytokine.hmap.genes$gene)
+
+# plots
+scoredf.cytokine$group <- c(rep('Control', 21), rep('FIP', 21))
+scoredf.cytokine$tissue <- ifelse(grepl('liver', rownames(scoredf.cytokine)), 'Liver', ifelse(grepl('lung', rownames(scoredf.cytokine)), 'Lung', 'MLN'))
+
+ggplot(scoredf.cytokine, aes(group, TotalScore, fill = group)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  facet_wrap(vars(tissue), nrow = 1) +
+  theme_bw()
+
+plotDispersion(scoredf.cytokine, annot = scoredf.cytokine$group)
+
+# calculate p-values
+permuteResult <-
+  generateNull(
+    upSet = ifn.hmap.genes$Gene,
+    rankData = rankData,
+    centerScore = TRUE,
+    knownDirection = TRUE,
+    B = 10000,
+    ncores = 1,
+    seed = 1,
+    useBPPARAM = NULL
+  )
+
+pvals <- getPvals(permuteResult, scoredf.cytokine)
+
+wilcox.test(scoredf.cytokine[scoredf.cytokine$group == 'Control' & scoredf.cytokine$tissue == 'Liver',]$TotalScore, 
+            scoredf.cytokine[scoredf.cytokine$group == 'FIP' & scoredf.cytokine$tissue == 'Liver',]$TotalScore)
+
+wilcox.test(scoredf.cytokine[scoredf.cytokine$group == 'Control' & scoredf.cytokine$tissue == 'Lung',]$TotalScore, 
+            scoredf.cytokine[scoredf.cytokine$group == 'FIP' & scoredf.cytokine$tissue == 'Lung',]$TotalScore)
+
+wilcox.test(scoredf.cytokine[scoredf.cytokine$group == 'Control' & scoredf.cytokine$tissue == 'MLN',]$TotalScore, 
+            scoredf.cytokine[scoredf.cytokine$group == 'FIP' & scoredf.cytokine$tissue == 'MLN',]$TotalScore)
+
+write.table(scoredf.cytokine, file = 'cytokines_chemokines_gene_set_scores.txt', sep = '\t', quote = FALSE)
+
+# adaptive immune response
+# calculate scores
+scoredf.adaptive <- simpleScore(rankData, upSet = adative.hmap.genes$gene)
+
+# plots
+scoredf.adaptive$group <- c(rep('Control', 21), rep('FIP', 21))
+scoredf.adaptive$tissue <- ifelse(grepl('liver', rownames(scoredf.adaptive)), 'Liver', ifelse(grepl('lung', rownames(scoredf.adaptive)), 'Lung', 'MLN'))
+
+ggplot(scoredf.adaptive, aes(group, TotalScore, fill = group)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1) +
+  facet_wrap(vars(tissue), nrow = 1) +
+  theme_bw()
+
+plotDispersion(scoredf.adaptive, annot = scoredf.adaptive$group)
+
+# calculate p-values
+permuteResult <-
+  generateNull(
+    upSet = ifn.hmap.genes$Gene,
+    rankData = rankData,
+    centerScore = TRUE,
+    knownDirection = TRUE,
+    B = 10000,
+    ncores = 1,
+    seed = 1,
+    useBPPARAM = NULL
+  )
+
+pvals <- getPvals(permuteResult, scoredf.adaptive)
+
+wilcox.test(scoredf.adaptive[scoredf.adaptive$group == 'Control' & scoredf.adaptive$tissue == 'Liver',]$TotalScore, 
+            scoredf.adaptive[scoredf.adaptive$group == 'FIP' & scoredf.adaptive$tissue == 'Liver',]$TotalScore)
+
+wilcox.test(scoredf.adaptive[scoredf.adaptive$group == 'Control' & scoredf.adaptive$tissue == 'Lung',]$TotalScore, 
+            scoredf.adaptive[scoredf.adaptive$group == 'FIP' & scoredf.adaptive$tissue == 'Lung',]$TotalScore)
+
+wilcox.test(scoredf.adaptive[scoredf.adaptive$group == 'Control' & scoredf.adaptive$tissue == 'MLN',]$TotalScore, 
+            scoredf.adaptive[scoredf.adaptive$group == 'FIP' & scoredf.adaptive$tissue == 'MLN',]$TotalScore)
+
+write.table(scoredf.adaptive, file = 'adaptive_immune_response_gene_set_scores.txt', sep = '\t', quote = FALSE)
+```

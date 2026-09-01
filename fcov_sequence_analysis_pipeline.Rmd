@@ -1,0 +1,1950 @@
+---
+title: "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire - FCoV sequence analysis pipeline"
+author: "Tom Hiron"
+date: "2026"
+output: 
+  html_document:
+    theme: "simplex"
+    toc: true
+    toc_float: true
+    highlight: kate
+    code_folding: show
+    self_contained: true
+---
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE, 
+                      echo = TRUE, 
+                      eval = TRUE,
+                      fig.path = 'figures/',
+                      fig.ext = 'png',
+                      cache = FALSE,
+                      cache.path = 'cache/')
+```
+
+Pipeline to reproduce feline coronavirus (FCoV) sequence analyses in the manuscript "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire", Hiron et al. 2025, https://www.biorxiv.org/content/10.1101/2025.10.02.679983v1.
+
+## Data availability
+
+Sequencing data supporting the findings of this study have been deposited in the National Center for Biotechnology Information (NCBI) Sequence Read Archive under BioProject ID PRJNA1330231.
+
+## Alignment to FCoV C1Je (DQ848678)
+
+STAR v2.7.11b.
+
+Prepare STAR index for hybrid assembly of felCat9 and FCoV C1Je (DQ848678). A FASTA file for the hybrid assembly was prepared by concatenating the FCoV C1Je genome sequence and the felCat9 genome FASTA used for the main RNA-seq analysis. A hybrid assembly GTF file was prepared by adding the following lines to the felCat9 genome GTF from Ensembl:
+
+```
+c1je_DQ848678.1 Prodigal_v2.6.3 gene    1       29255   .       +       .       gene_id "c1je_genome"
+c1je_DQ848678.1 Prodigal_v2.6.3 exon    1       29255   .       +       .       gene_id "c1je_genome"
+c1je_DQ848678.1 Prodigal_v2.6.3 CDS     1       29255   .       +       .       gene_id "c1je_genome"
+```
+
+```{r alignSTAR_fcov_index, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J build_STAR_index_fc9_ensembl111_c1je.job 
+#SBATCH -o build_STAR_index_fc9_ensembl111_c1je.out 
+#SBATCH -c 8
+
+refdir=felCat9_c1je
+
+STAR --runThreadN 8 --runMode genomeGenerate \
+--genomeDir $refdir/fc9_ens111_c1je_STAR_index \
+--genomeFastaFiles $refdir/Felis_catus.Felis_catus_9.0.c1je.dna.toplevel.fa \
+--sjdbGTFfile $refdir/Felis_catus.Felis_catus_9.0.111.c1je.gtf \
+--sjdbOverhang 149
+```
+
+Mapping:
+
+```{r alignSTAR_fcov_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J align_STAR_feline_c1je.job 
+#SBATCH -o align_STAR_feline_c1je.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+outpath=fcov_reads/alignments
+
+cd $inpath
+
+fnames=()
+for fname in *_1.trimmed.fastq.gz
+do
+	fname=${fname%_1.trimmed.fastq.gz}
+	fnames[${#fnames[@]}]=$fname
+done
+
+cd $path
+
+#input variables
+seqfile1=$inpath/${fnames[$i]}_1.trimmed.fastq.gz
+seqfile2=$inpath/${fnames[$i]}_2.trimmed.fastq.gz
+
+#other variables
+outprefix=$outpath/${fnames[$i]}_
+refdir=fc9_ens111_c1je_STAR_index
+
+STAR --runThreadN 2 --genomeDir $refdir --readFilesIn $seqfile1 $seqfile2 --outFileNamePrefix $outprefix --outSAMunmapped Within \
+    --outFilterMultimapNmax 10 --alignSJoverhangMin 5 --alignSJDBoverhangMin 3 --outFilterMismatchNmax 10 --outFilterMismatchNoverLmax 0.04 \
+    --alignIntronMin 21 --alignIntronMax 0 --alignMatesGapMax 0 --outFilterIntronMotifs RemoveNoncanonical --outSAMtype BAM SortedByCoordinate \
+    --readFilesCommand zcat
+```
+
+```{r alignSTAR_fcov_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fnames=()
+for fname in *_1.trimmed.fastq.gz
+do
+	fname=${fname%_1.trimmed.fastq.gz}
+	fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+cd $path
+
+sbatch --array 1-$fnamecount:1 align_STAR_feline_c1je_secondary.sh
+```
+
+## Filtering
+
+Samtools v1.21.
+
+Filter alignments to retain uniquely aligned and properly paired reads. 
+
+```{r bam_filter_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J bam_filter.job 
+#SBATCH -o bam_filter.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+outpath=filtered
+
+fnames=()
+for fname in *.sortedByCoord.out.bam
+do
+        fname=${fname%.sortedByCoord.out.bam}
+        fnames[${#fnames[@]}]=$fname
+done
+
+infile=$path/${fnames[$i]}.sortedByCoord.out.bam
+outfile=$outpath/${fnames[$i]}.filtered.bam
+
+#function
+samtools view -h -b -f 2 -q 255 $infile > $outfile
+samtools index $outfile
+```
+
+```{r bam_filter_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+fnames=()
+for fname in *.sortedByCoord.out.bam
+do
+        fname=${fname%.sortedByCoord.out.bam}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+sbatch --array 1-$fnamecount:1 bam_filter_secondary.sh
+```
+
+## Read summarisation
+
+Samtools v1.21.
+
+Sort alignments by name: 
+
+```{r bam_nameSort_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J bam_nameSort.job 
+#SBATCH -o bam_nameSort.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+bams=()
+for bam in *filtered.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+
+#define variables
+infile=$path/${bams[$i]}.bam
+outfile=$path/${bams[$i]}.nameSorted.bam
+
+#function
+samtools sort -n -@ 4 $infile -o $outfile
+```
+
+```{r bam_nameSort_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+bams=()
+for bam in *filtered.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+bamcount=${#bams[@]}
+
+sbatch --array 1-$bamcount:1 bam_nameSort_secondary.sh
+```
+
+Rsubread v2.20.
+
+Get gene-level counts:
+
+```{r read_summ, eval = FALSE}
+bam.files <- list.files(pattern = "*nameSorted.bam$", full.names = TRUE)
+
+library(Rsubread)
+
+ens111_c1je_fc <- featureCounts(files = bam.files, 
+                                annot.ext = "Felis_catus.Felis_catus_9.0.111.c1je.gtf", 
+                                isGTFAnnotationFile = TRUE, 
+                                GTF.attrType = 'gene_id', 
+                                isPairedEnd = TRUE, 
+                                nthreads = 4)
+```
+
+## FCoV abundance heatmap
+
+```{r fcov_counts_hmap}
+library(edgeR)
+library(stringr)
+library(reshape2)
+
+# get normalised FCoV counts
+fcov.counts <- ens111_c1je_fc$counts
+colnames(fcov.counts) <- str_remove(colnames(fcov.counts), 'feline_')
+colnames(fcov.counts) <- str_remove(colnames(fcov.counts), '_Aligned.filtered.nameSorted.bam')
+
+fcov.counts <- as.data.frame(fcov.counts)
+fcov.counts$Gene <- rownames(fcov.counts)
+rownames(fcov.counts) <- NULL
+fcov.counts <- subset(fcov.counts, select = c(43, 1:42))
+
+z <- DGEList(counts = fcov.counts[,2:43], genes = fcov.counts$Gene, remove.zeros = TRUE) 
+
+z$samples$group <- factor(c(rep('Control', 21), rep('FIP', 21)), levels = c('Control', 'FIP'))
+z$samples$tissue <- ifelse(grepl('liver', rownames(z$samples)), 'Liver', ifelse(grepl('lung', rownames(z$samples)), 'Lung', 'MLN'))
+
+# recalculate library sizes
+z$samples$lib.size <- colSums(z$counts)
+
+# use Ensembl IDs as row names
+rownames(z$counts) <- rownames(z$genes) <- z$genes$genes
+
+# TMM Normalisation
+z <- calcNormFactors(z)
+z$samples
+
+# design matrix
+Group <- z$samples$group
+Tissue <- z$samples$tissue
+data.frame(Sample = colnames(z), Group, Tissue)
+
+design <- model.matrix(~Tissue+Group)
+rownames(design) <- colnames(z)
+design
+
+fcov.log.base.counts <- cpm(z, prior.count = 1, log = TRUE, normalized.lib.sizes = TRUE)
+
+fcov.df <- as.data.frame(fcov.log.base.counts)
+fcov.df$gene <- rownames(fcov.df)
+
+fcov.df <- fcov.df[fcov.df$gene == 'c1je_genome',]
+fcov.df$gene <- NULL
+
+fcov.melt <- melt(fcov.df)
+fcov.melt$group <- z$samples$group
+fcov.melt$tissue <- z$sample$tissue
+
+# create matrix for heatmap 
+fcov.hmap <- fcov.melt
+rownames(fcov.hmap) <- fcov.hmap$variable
+fcov.hmap$variable <- NULL
+fcov.hmap$group <- NULL
+fcov.hmap$cat <- stringr::str_extract(rownames(fcov.hmap), "[^_]*_[^_]*")
+# export
+write.table(fcov.hmap, file = 'fcov_per_sample.txt', sep = '\t', quote = FALSE)
+
+fcov.mat <- acast(fcov.hmap, cat ~ tissue)
+
+# set row order
+mat.col.order <- c('control_54', 'control_69', 'control_135', 'control_136', 'control_164', 'control_174', 'control_188', 'fip_37', 'fip_68', 'fip_86', 'fip_96', 'fip_120', 'fip_172', 'fip_142', 'fip_192')
+fcov.mat <- fcov.mat[mat.col.order,]
+
+# plot
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+
+breaks = seq(-7, 12, 0.1)
+hmcols = colorRampPalette(brewer.pal(9, 'OrRd'))(length(breaks))
+
+pheatmap(fcov.mat,
+         breaks = breaks,
+         color = hmcols,
+         na_col = 'darkgrey',
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         angle_col = 45,
+         cellheight = 20,
+         cellwidth = 20,
+         gaps_row = 7)
+```
+
+## FCoV abundance vs gene set scores
+
+```{r fcov_vs_genesetscores}
+library(ggplot2)
+
+# read in gene set scores
+scoredf.ifn <- read.csv('interferon_gene_set_scores.txt', sep = '\t', header = TRUE)
+scoredf.cytokine <- read.csv('cytokines_chemokines_gene_set_scores.txt', sep = '\t', header = TRUE)
+scoredf.adaptive <- read.csv('adaptive_immune_response_gene_set_scores.txt', sep = '\t', header = TRUE)
+
+# interferon stimulated genes
+scoredf.ifn$fcov <- fcov.hmap$value
+
+ggplot(scoredf.ifn, aes(fcov, TotalScore)) +
+  geom_smooth(method = 'lm', color = 'black') +
+  geom_point(aes(fill = tissue, shape = group), size = 2.5) +
+  scale_shape_manual(values = c(21, 23)) +
+  scale_fill_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Interferon alpha response score', fill = '', shape = '') +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+summary(lm(fcov ~ TotalScore, data = scoredf.ifn))
+cor.test(scoredf.ifn$fcov, scoredf.ifn$TotalScore)
+
+# cytokines/chemokines
+scoredf.cytokine$fcov <- fcov.hmap$value
+
+ggplot(scoredf.cytokine, aes(fcov, TotalScore)) +
+  geom_smooth(method = 'lm', color = 'black') +
+  geom_point(aes(fill = tissue, shape = group), size = 2.5) +
+  scale_shape_manual(values = c(21, 23)) +
+  scale_fill_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Cytokine/chemokine score', fill = '', shape = '') +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+summary(lm(fcov ~ TotalScore, data = scoredf.cytokine))
+cor.test(scoredf.cytokine$fcov, scoredf.cytokine$TotalScore)
+
+# adaptive immune response
+scoredf.adaptive$fcov <- fcov.hmap$value
+
+ggplot(scoredf.adaptive, aes(fcov, TotalScore)) +
+  geom_smooth(method = 'lm', color = 'black') +
+  geom_point(aes(fill = tissue, shape = group), size = 2.5) +
+  scale_shape_manual(values = c(21, 23)) +
+  scale_fill_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Adaptive immune response score', fill = '', shape = '') +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+summary(lm(fcov ~ TotalScore, data = scoredf.adaptive))
+cor.test(scoredf.adaptive$fcov, scoredf.adaptive$TotalScore)
+```
+
+## FCoV genome assembly
+
+Samtools v1.21.
+
+Extract unmapped reads following alignment to felCat9.
+
+```{r extract_unmapped_reads_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J extract_unmapped_reads.job 
+#SBATCH -o extract_unmapped_reads.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+outpath=unmapped
+
+bams=()
+for bam in *.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+
+# define variables
+infile=$path/${bams[$i]}.bam
+outfile1=$outpath/${bams[$i]}.unmapped.bam
+outfile2=$outpath/${bams[$i]}.unmapped.sorted.bam
+fq1=$path/${bams[$i]}.1.fq
+fq2=$path/${bams[$i]}.2.fq
+
+samtools view -@ 2 -b -f 4 $infile > $outfile1
+samtools sort -n -@ 2 $outfile1 -o $outfile2
+bamToFastq -i $outfile2 -fq $fq1 -fq2 $fq2
+```
+
+```{r extract_unmapped_reads_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+bams=()
+for bam in *.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+bamcount=${#bams[@]}
+
+sbatch --array 1-$bamcount:1 extract_unmapped_reads_secondary.sh
+```
+
+coronaSPAdes v3.15.4.
+
+Assemble unmapped reads using coronaSPAdes with default settings. 
+
+```{r coronaspades_assemble_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J coronaspades_assemble.job 
+#SBATCH -o coronaspades_assemble.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+outpath=coronaspades
+
+cd $inpath
+
+fqs=()
+for fq in *.merged.unmapped.1.fastq
+do
+        fq=${fq%.merged.unmapped.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+
+cd $path
+
+#define variables
+fq1=$inpath/${fqs[$i]}.merged.unmapped.1.fastq
+fq2=$inpath/${fqs[$i]}.merged.unmapped.2.fastq
+outfile=$outpath/${fqs[$i]}
+
+coronaspades.py -o $outfile -1 $fq1 -2 $fq2
+```
+
+```{r coronaspades_assemble_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fqs=()
+for fq in *.merged.unmapped.1.fastq
+do
+        fq=${fq%.merged.unmapped.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+fqcount=${#fqs[@]}
+
+cd $path
+
+sbatch --array 1-$fqcount:1 coronaspades_assemble_secondary.sh
+```
+
+Split assemblies by scaffold using UCSC `faSplit` (installed via conda).
+
+```{r coronaspades_split_by_scaffold_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J coronaspades_split_by_scaffold.job 
+#SBATCH -o coronaspades_split_by_scaffold.%A_%a.out 
+#SBATCH -c 1
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+dirs=()
+for dir in *
+do
+        dir=${dir}
+        dirs[${#dirs[@]}]=$dir
+done
+
+#define variables
+fasta=$path/${dirs[$i]}/scaffolds.fasta
+outpath=$path/${dirs[$i]}/split_by_scaffold/
+
+#function
+mkdir $outpath
+faSplit byname $fasta $outpath
+```
+
+```{r coronaspades_split_by_scaffold_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+dirs=()
+for dir in *
+do
+        dir=${dir}
+        dirs[${#dirs[@]}]=$dir
+done
+dircount=${#dirs[@]}
+
+sbatch --array 1-$dircount:1 coronaspades_split_by_scaffold_secondary.sh
+```
+
+Tabulate longest scaffold lengths for all samples and plot. 
+
+```{r coronaspades_longest_scaffolds}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+# read in data
+assembled.stats <- read.csv('coronaspades_longest_scaffolds.txt', sep = '\t', header = TRUE, row.names = NULL)
+colnames(assembled.stats)
+# [1] "Sample"                    "Group"                    
+# [3] "Tissue"                    "Longest.scaffold"
+
+# order within groups
+assembled.stats.grpranked <- assembled.stats %>% arrange(Group, desc(Longest.scaffold))
+assembled.stats.grpranked$Sample <- factor(assembled.stats.grpranked$Sample, levels = assembled.stats.grpranked$Sample)
+
+ggplot(assembled.stats.grpranked, aes(Sample, Longest.scaffold, fill = Tissue)) +
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,30000), breaks = seq(0,30000,5000)) +
+  facet_wrap(vars(Group), scales = 'free') +
+  labs(x = '', y = 'Scaffold length (nt)') +
+  theme_bw() +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        panel.grid = element_blank())
+```
+
+## Phylogenetic tree
+
+Full-length FCoV genome sequences were retrieved from NCBI Virus and aligned with coronaSPAdes-assembled FCoV genomes from this study. Sequences were aligned using MUSCLE (v3.8.31) in AliView (v1.28). Maximum-likelihood (ML) trees were generated from the aligned sequences using RAxML with the GTRGAMMAIX model (selected using [modeltest](https://github.com/ddarriba/modeltest)). 
+
+```{r fcov_tree_raxml, engine = 'bash', eval = FALSE}
+raxmlHPC-PTHREADS -T 2 -m GTRGAMMAIX -s fig3_fipv_fecv_fcov2_fcovcandidates_ferretcovoutgroup_polyatrimmed_muscle.fa -n fig3_fipv_fecv_fcov2_fcovcandidates_ferretcovoutgroup_polyatrimmed_muscle.ML -o NC_030292.1 -p 11334 -k -f a -x 13243 -N 100 
+```
+
+Import best-scoring ML tree with bootstrap support and plot with annotation data.
+
+```{r fcov_tree_plot}
+library(ggtree)
+
+# load tree data 
+fcov.tree <- read.tree('RAxML_bipartitions.fig3_fipv_fecv_fcov2_fcovcandidates_ferretcovoutgroup_polyatrimmed_muscle.ML')
+
+# remove all but sample id/group from names
+fcov.tree$tip.label <- gsub('feline_', '', fcov.tree$tip.label)
+fcov.tree$tip.label <- gsub('_node_1.*', '', fcov.tree$tip.label)
+# add annotation data
+fcov.tree.anno <- read.csv(file = 'fcov_tree_anno.txt', sep = '\t', header = TRUE)
+colnames(fcov.tree.anno)
+# [1] "Sequence" "Biotype"  "Serotype"
+
+# build tree with annotation data
+p <- ggtree(fcov.tree, layout = 'rectangular', ladderize = TRUE) +
+  geom_treescale() +
+  # geom_nodepoint(aes(color = as.numeric(label))) +
+  # geom_nodelab(size = 1.5, nudge_x = 0.02, node = 'internal') +
+  geom_tiplab(align = FALSE, as_ylab = TRUE, colour = 'black') 
+
+p2 <- p %<+% fcov.tree.anno +
+  geom_tippoint(aes(color = Biotype)) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', 'grey')) +
+  geom_point2(aes(label = label, subset = !is.na(as.numeric(label)) & as.numeric(label) > 80), shape = 23, fill = 'grey')
+```
+
+## Multiple sequence alignments
+
+Open reading frames (ORFs) were predicted in the assembled FCoV genomes using Prodigal (v2.6.3), and predicted Spike proteins were aligned with Spike proteins from FECV sequences available in NCBI Virus using Clustal Omega (https://www.ebi.ac.uk/jdispatcher/msa/clustalo).
+
+Visualise Spike protein alignments at key sites. 
+
+```{r spike_alignment}
+library(ggmsa)
+library(Biostrings)
+
+spike.align <- readAAMultipleAlignment(filepath = 'fcov_public_and_candidates_spike_clustal.aln',
+                                       format = 'clustal')
+
+# M1058L
+ggmsa(spike.align, 1047, 1059, font = "mono", char_width = 0.5, seq_name = TRUE, border = NA, color = 'LETTER')
+
+# S1/S2
+ggmsa(spike.align, 786, 800, font = "mono", char_width = 0.5, seq_name = TRUE, border = NA, color = 'LETTER')
+```
+
+Visualise alignment of predicted ORF3c protein sequences. 
+
+```{r orf3c_alignment}
+library(ggmsa)
+library(Biostrings)
+library(aplot)
+
+orf3c.nt.align <- readDNAMultipleAlignment(filepath = 'all_fcov_candidates_orf3c_nt_clustal.fa', format = 'fasta')
+
+gg.ntmsa <- ggmsa(
+  orf3c.nt.align,
+  font = NULL,
+  color = 'Chemistry_NT',
+  seq_name = TRUE,
+  border = 'white',
+  show.legend = TRUE
+) 
+
+orf3c.aa.trunc.align <- readAAMultipleAlignment(filepath = 'all_fcov_candidates_orf3c_aa_clustal.fa', format = 'fasta')
+
+gg.aamsa <- ggmsa(
+  orf3c.aa.trunc.align,
+  font = NULL,
+  color = 'LETTER',
+  seq_name = TRUE,
+  border = 'white',
+  show.legend = TRUE
+) 
+
+aplot::plot_list(gg.ntmsa, gg.aamsa, ncol = 1)
+```
+
+Visualise alignment of Spike domain 0 deletions.
+
+```{r spike_domain0del_alignment}
+library(ggmsa)
+library(Biostrings)
+
+domain0.nt.align <- readDNAMultipleAlignment(filepath = 'spike_domain0_nt_clustal.msa', format = 'fasta')
+
+gg.sntmsa <- ggmsa(
+  domain0.nt.align,
+  font = NULL,
+  color = 'Chemistry_NT',
+  seq_name = TRUE,
+  border = 'white',
+  show.legend = TRUE
+)
+```
+
+## FCoV C1Je genome coverage
+
+Align the (unmapped) RNA-seq reads used for FCoV assembly with coronaSPAdes to the FCoV C1Je (DQ848678.1) genome using BWA-MEM and calculate depth at each position using Samtools. 
+
+```{r c1je_align_unmapped_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J c1je_align_unmapped.job 
+#SBATCH -o c1je_align_unmapped.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+outpath=bam
+
+cd $inpath
+
+fqs=()
+for fq in *1.fastq
+do
+        fq=${fq%.merged.unmapped.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+
+cd $path
+
+#define variables
+fq1=$inpath/${fqs[$i]}.unmapped.1.fastq
+fq2=$inpath/${fqs[$i]}.unmapped.2.fastq
+
+refpath=DQ848678_c1je.fa
+
+outfile=$outpath/${fqs[$i]}.unmapped.c1je
+sortfile=$outpath/${fqs[$i]}.unmapped.c1je_sorted.bam
+
+#function
+bwa mem -t 4 -o $outfile.sam -a $refpath $fq1 $fq2
+samtools sort -@ 4 -o $sortfile $outfile.sam
+samtools index $sortfile
+```
+
+```{r c1je_align_unmapped_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fqs=()
+for fq in *1.fastq
+do
+        fq=${fq%.merged.unmapped.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+fqcount=${#fqs[@]}
+
+cd $path
+
+sbatch --array 1-$fqcount:1 c1je_align_unmapped_secondary.sh
+```
+
+Get read depth at each position in DQ848678.1 using `samtools depth`.
+
+```{r c1je_depth_calc, engine = 'bash', eval = FALSE}
+cat *c1je_sorted.bam > files.txt
+
+samtools depth -a -H -f files.txt > all_samples_depth_c1je.txt
+```
+
+Read data into R and plot.
+
+```{r c1je_depth_plot}
+library(ggplot2)
+library(reshape2)
+library(viridis)
+
+# read in depth
+c1je.depth <- read.csv('all_samples_depth_c1je.txt', sep = '\t', header = T)
+# melt
+c1je.depth.melt <- melt(c1je.depth, id.vars = c('CHROM', 'POS'))
+# set colours
+cat.pal = viridis(n = 5, option = 'turbo')
+# plot
+ggplot(c1je.depth.melt, aes(POS, value, color = variable)) +
+  geom_line() +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 29250), breaks = seq(0,30000, 5000)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1e6), breaks = c(0, 10, 100, 1000, 10000, 100000, 1e6), trans=scales::pseudo_log_trans(base = 10)) +
+  scale_color_manual(values = cat.pal) +
+  labs(x = '', y = 'Aligned read depth', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## S gene percent identity
+
+Align S gene sequences using e.g. Clustal Omega and calculate percent identity matrix.
+
+```{r s_pid_matrix}
+library(pheatmap)
+library(viridis)
+# hmcols = colorRampPalette(c("blue", "white"))(200)
+
+breaks = seq(80, 100, 0.2)
+
+# read in pid matrix
+pim.spike <- read.csv('s_pid_matrix.txt', sep = '\t', header = TRUE, row.names = 1)
+
+pheatmap(pim.spike,
+         breaks = breaks,
+         angle_col = 45,
+         cellwidth = 25,
+         cellheight = 25)
+```
+
+## Aligning reads to FCoV assemblies from MLN samples
+
+For each cat, map reads used for FCoV assembly from all tissues to the FCoV assembly from MLN reads for analysis of intrahost single nucleotide variants (iSNVs). 
+
+```{r mln_align_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J mln_align.job 
+#SBATCH -o mln_align.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+refpath=feline_fip_86_mln_bwa_index
+outpath=mln_aln/86_mln
+
+cd $inpath
+
+fqs=()
+for fq in *86*.1.fastq
+do
+        fq=${fq%.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+
+cd $path
+
+#find
+fq1=$inpath/${fqs[$i]}.1.fastq
+fq2=$inpath/${fqs[$i]}.2.fastq
+
+#define variables
+outfile=$outpath/${fqs[$i]}.mappedto86mln
+
+#function
+bwa mem -t 4 -o $outfile.sam -a $refpath $fq1 $fq2
+samtools sort -@ 4 -o $outfile.sorted.bam $outfile.sam
+samtools index $outfile.sorted.bam
+
+# adapt for each cat
+```
+
+```{r mln_align_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fqs=()
+for fq in *86*.1.fastq
+do
+        fq=${fq%.1.fastq}
+        fqs[${#fqs[@]}]=$fq
+done
+fqcount=${#fqs[@]}
+
+cd $path
+
+sbatch --array 1-$fqcount:1 mln_align_secondary.sh
+```
+
+Calculate mean depth for each sample using `samtools coverage`.
+
+```{r mln_align_coverage_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+#SBATCH -J mln_align_coverage.job 
+#SBATCH -o mln_align_coverage.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+inpath=`pwd`
+
+bams=()
+for bam in *.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+
+infile=$inpath/${bams[$i]}.bam
+outfile=$inpath/coverage/${bams[$i]}_coverage.txt
+
+samtools coverage $infile -o $outfile
+```
+
+```{r mln_align_coverage_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+bams=()
+for bam in *.bam
+do
+        bam=${bam%.bam}
+        bams[${#bams[@]}]=$bam
+done
+bamcount=${#bams[@]}
+
+sbatch --array 1-$bamcount:1 mln_align_coverage_secondary.sh
+```
+
+Read in data and plot.
+
+```{r mln_align_coverage}
+library(tidyverse)
+library(stringr)
+library(ggplot2)
+
+# read in samtools coverage output
+file.list <- list.files(path = 'mln_aln/coverage', full.names = TRUE)
+
+cov.df <- file.list %>%
+  map_df(read.table)
+
+cov.names <- str_remove(list.files(path = 'mln_aln/coverage'), '.unmapped.*')
+cov.names <- str_remove(cov.names, '.merged.*')
+cov.names <- str_remove(cov.names, 'feline_')
+
+colnames(cov.df) <- c(
+  'rname',
+  'startpos',
+  'endpos',
+  'numreads',
+  'covbases',
+  'coverage',
+  'meandepth',
+  'meanbaseq',
+  'meanmapq'
+)
+rownames(cov.df) <- cov.names
+cov.df$rname <- NULL
+cov.df$cat <- as.character(c(120, 120, 172, 172, 172, 68, 68, 68, 86, 86, 86, 96, 96))
+cov.df$tissue <- ifelse(grepl('mln', rownames(cov.df)), 'MLN', ifelse(grepl('liver', rownames(cov.df)), 'Liver', 'Lung'))
+
+write.table(cov.df, file = 'mln_mapped_coverage.txt', sep = '\t')
+# missing samples manually added for plotting, i.e. zeros in place of missing assemblies/tissues
+cov.df.plot <- read.csv(file = 'mln_mapped_coverage_with_missing_tissues.txt', sep = '\t', header = TRUE)
+
+cov.df.plot$cat <- factor(cov.df.plot$cat, levels = c(68, 86, 96, 120, 172))
+
+# plot bar chart
+tissue.pal <- c('#EA8131', '#5EC64F', '#033BF4')
+
+ggplot(cov.df.plot, aes(cat, log10(meandepth + 1), fill = tissue)) +
+  geom_col(position = position_dodge(preserve = 'single')) +
+  # geom_hline(yintercept = 2, lty = 'dashed', colour = 'black') +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 5)) +
+  scale_fill_manual(values = tissue.pal) +
+  facet_grid( ~ cat, scales = 'free_x') +
+  labs(x = '',
+       y = expression(log[10] * ' mean coverage'),
+       fill = 'Tissue') +
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank()
+  )
+```
+
+## Call iSNVs with LoFreq
+
+Using LoFreq (v2.1.5), call variants in viral reads for each sample relative to the MLN assembly for the same cat.
+
+First, add indel qualities.
+
+```{r lofreq_dindel_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J lofreq_dindel.job 
+#SBATCH -o lofreq_dindel.%A_%a.out 
+#SBATCH -c 8
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+refpath=fasta
+bampath=bams
+outpath=dindel
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+
+cd $path
+
+reffile=$refpath/${fnames[$i]}_mln.fa
+
+# create input file variables if the file exists, otherwise leave them empty
+if [ -e "$bampath/${fnames[$i]}_mln.bam" ]
+then
+	mlnfile=$bampath/${fnames[$i]}_mln.bam
+else
+	mlnfile=""
+fi
+
+if [ -e "$bampath/${fnames[$i]}_liver.bam" ]
+then
+	liverfile=$bampath/${fnames[$i]}_liver.bam
+else
+	liverfile=""
+fi
+
+if [ -e "$bampath/${fnames[$i]}_lung.bam" ]
+then
+	lungfile=$bampath/${fnames[$i]}_lung.bam
+else
+	lungfile=""
+fi
+
+#function
+lofreq indelqual --dindel -f $reffile -o $outpath/${fnames[$i]}_mln_dindel.bam $mlnfile
+lofreq indelqual --dindel -f $reffile -o $outpath/${fnames[$i]}_liver_dindel.bam $liverfile
+lofreq indelqual --dindel -f $reffile -o $outpath/${fnames[$i]}_lung_dindel.bam $lungfile
+```
+
+```{r lofreq_dindel_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+refpath=fasta
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+cd $path
+
+sbatch --array 1-$fnamecount:1 lofreq_dindel_secondary.sh
+```
+
+Call variants.
+
+```{r lofreq_call_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J lofreq_call.job 
+#SBATCH -o lofreq_call.%A_%a.out 
+#SBATCH -c 8
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+refpath=fasta
+bampath=dindel
+outpath=vcf
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+
+cd $path
+
+reffile=$refpath/${fnames[$i]}_mln.fa
+
+# create input file variables if the file exists, otherwise leave them empty
+if [ -e "$bampath/${fnames[$i]}_mln_dindel.bam" ]
+then
+	mlnfile=$bampath/${fnames[$i]}_mln_dindel.bam
+else
+	mlnfile=""
+fi
+
+if [ -e "$bampath/${fnames[$i]}_liver_dindel.bam" ]
+then
+	liverfile=$bampath/${fnames[$i]}_liver_dindel.bam
+else
+	liverfile=""
+fi
+
+if [ -e "$bampath/${fnames[$i]}_lung_dindel.bam" ]
+then
+	lungfile=$bampath/${fnames[$i]}_lung_dindel.bam
+else
+	lungfile=""
+fi
+
+#function
+lofreq call --call-indels -f $reffile -o ${fnames[$i]}_mln.vcf $mlnfile
+lofreq call --call-indels -f $reffile -o ${fnames[$i]}_liver.vcf $liverfile
+lofreq call --call-indels -f $reffile -o ${fnames[$i]}_lung.vcf $lungfile
+```
+
+```{r lofreq_call_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+refpath=fasta
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+cd $path
+
+sbatch --array 1-$fnamecount:1 lofreq_call_secondary.sh
+```
+
+Annotate variants using SnpEff (v5.2). Custom databases were built for each MLN FCoV genome using the whole genome FASTA and GFF output from ORF prediction with Prodigal. 
+
+```{r snpeff_annotate_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J snpeff_annotate.job 
+#SBATCH -o snpeff_annotate.%A_%a.out 
+#SBATCH -c 1
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+refpath=fasta
+vcfpath=vcf
+outpath=snpeff
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+
+cd $path
+
+refname=${fnames[$i]}_mln
+
+# create input file variables if the file exists, otherwise leave them empty
+if [ -e "$vcfpath/${fnames[$i]}_mln.vcf" ]
+then
+	mlnfile=$vcfpath/${fnames[$i]}_mln.vcf
+else
+	mlnfile=""
+fi
+
+if [ -e "$vcfpath/${fnames[$i]}_liver.vcf" ]
+then
+	liverfile=$vcfpath/${fnames[$i]}_liver.vcf
+else
+	liverfile=""
+fi
+
+if [ -e "$vcfpath/${fnames[$i]}_lung.vcf" ]
+then
+	lungfile=$vcfpath/${fnames[$i]}_lung.vcf
+else
+	lungfile=""
+fi
+
+outmln=snpeff/${fnames[$i]}_mln_snpeff.vcf
+outliver=snpeff/${fnames[$i]}_liver_snpeff.vcf
+outlung=snpeff/${fnames[$i]}_lung_snpeff.vcf
+
+#function
+snpEff -no-downstream -no-intergenic -no-upstream -no-utr -v $refname $mlnfile > $outmln
+snpEff -no-downstream -no-intergenic -no-upstream -no-utr -v $refname $liverile > $outliver
+snpEff -no-downstream -no-intergenic -no-upstream -no-utr -v $refname $lungfile > $outlung
+```
+
+```{r snpeff_annotate_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+refpath=fasta
+
+cd $refpath
+
+fnames=()
+for fname in *mln.fa
+do
+        fname=${fname%_mln.fa}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+cd $path
+
+sbatch --array 1-$fnamecount:1 snpeff_annotate_secondary.sh
+```
+
+Export variants with a single variant per line as tab-delimited text for reading into R.
+
+```{r snpsift_export_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J snpsift_export.job 
+#SBATCH -o snpsift_export.%A_%a.out 
+#SBATCH -c 1
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+fnames=()
+for fname in *.vcf
+do
+        fname=${fname%.vcf}
+        fnames[${#fnames[@]}]=$fname
+done
+
+infile=$path/${fnames[$i]}.vcf
+outfile=$path/${fnames[$i]}.txt
+snpeffpath=/snpeff-5.2-1/scripts
+
+#function
+cat $infile \
+        | $snpeffpath/vcfEffOnePerLine.pl \
+        | SnpSift extractFields -e "." - "CHROM" "POS" "ID" "REF" "ALT" "FILTER" "DP" "AF" "DP4" "ANN[*].ALLELE" "ANN[*].EFFECT" "ANN[*].IMPACT" "ANN[*].GENE" "ANN[*].BIOTYPE" "ANN[*].HGVS_C" "ANN[*].HGVS_P" "ANN[*].AA_POS" > $outfile
+```
+
+```{r snpsift_export_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+fnames=()
+for fname in *.vcf
+do
+        fname=${fname%.vcf}
+        fnames[${#fnames[@]}]=$fname
+done
+fnamecount=${#fnames[@]}
+
+sbatch --array 1-$fnamecount:1 snpsift_export_secondary.sh
+```
+
+## Analysis of iSNVs
+
+Read in annotated and re-formatted variants called with LoFreq. Apply preliminary filters (AAF < 0.02, ALT reads < 5).
+
+```{r lofreq_filter}
+library(tidyverse)
+library(magrittr)
+
+# read in variants
+mln.vars.list <- list.files(path = 'mln_aln/lofreq',
+                            pattern = '*\\.txt',
+                            full.names = TRUE)
+mln.vars.names <- list.files(path = 'mln_aln/lofreq',
+                             pattern = '*_snpeff.txt',
+                             full.names = FALSE)
+mln.vars.names <- stringr::str_remove(mln.vars.names, '_snpeff.txt')
+
+vars1 <- vector("list", length(mln.vars.list))
+for (i in seq_along(mln.vars.list)) {
+  y <- suppressMessages(readr::read_delim(mln.vars.list[i], delim = '\t', col_names = TRUE))
+  vars1[[i]] <- y
+  vars1[[i]]$SAMPLE <- mln.vars.names[i]
+}
+names(vars1) <- mln.vars.names
+
+# add tissue and cat id for splitting
+id <- stringr::str_remove(mln.vars.names, 'feline_fip_')
+tissue <- stringr::str_remove(id, '[0-9].*_')
+tissue <- sapply(tissue, function(x) {
+  if (x == 'mln') {
+    stringr::str_to_upper(x)
+  } else {
+    stringr::str_to_title(x)
+  }
+})
+cat <- stringr::str_remove(id, '_.*')
+
+# removed fip_96_liver - no variants
+
+vars1 <- mapply(cbind,
+                vars1,
+                "cat" = cat,
+                "tissue" = tissue,
+                SIMPLIFY = FALSE)
+
+# merge variants
+vars2 <- Reduce(function(...)
+  merge(..., all = TRUE), vars1)
+
+# split DP4 column into separate fields - ref-forward bases, ref-reverse, alt-forward and alt-reverse
+vars2[c('DP_REF_FWD', 'DP_REF_REV', 'DP_ALT_FWD', 'DP_ALT_REV')] <- stringr::str_split_fixed(vars2$DP4, ';', 4)
+
+# filter variants in 5' and 3' UTRs
+vars3 <- vars2[vars2$POS < 28968 & vars2$POS > 260, ]
+
+# filter variants < 2%
+vars3 <- vars3[vars3$AF >= 0.02, ]
+table(vars3$cat, vars3$tissue)
+
+# filter variants with < 5 ALT reads
+vars3$DP_ALT <- as.numeric(vars3$DP_ALT_FWD) + as.numeric(vars3$DP_ALT_REV)
+vars3 <- vars3[vars3$DP_ALT >= 5, ]
+table(vars3$cat, vars3$tissue)
+
+# triallelic sites
+triallelic <- vars3 %>%
+  group_by(SAMPLE, POS) %>%
+  filter(n() > 1) %>%
+  ungroup()
+```
+
+Stacked bar plots of annotated variant effects.
+
+```{r lofreq_effects}
+library(ggplot2)
+
+# subset SNVs
+snvs <- vars3[vars3$`ANN[*].EFFECT` %in% c('missense_variant', 'synonymous_variant', 'stop_gained'),]
+
+# get number of SNVs in each gene in each sample
+snvcount <- as.data.frame(table(snvs$cat, snvs$tissue, snvs$`ANN[*].GENE`, snvs$`ANN[*].EFFECT`))
+colnames(snvcount) <- c('cat', 'tissue', 'gene', 'anno', 'count')
+snvcount$gene <- factor(snvcount$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+
+# normalise SNV counts by ORF lengths
+# write.table(snvcount, file = 'snv_count.txt', sep = '\t')
+
+snvcount.norm <- read.csv(file = 'snv_count_lengthnorm.txt', sep = '\t', header = TRUE)
+snvcount.norm$gene <- factor(snvcount.norm$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+snvcount.norm$tissue <- factor(snvcount.norm$tissue, levels = c('MLN', 'Liver', 'Lung'))
+
+# remove cat96
+snvcount.norm <- snvcount.norm[snvcount.norm$cat != 96,]
+
+consequence.pal <- c('#35b779', '#fde725', '#31688e')
+
+ggplot(snvcount.norm, aes(x = tissue, y = normcount, fill = anno, group = anno)) +
+  geom_bar(stat = 'identity', position = 'stack') + 
+  scale_fill_manual(values = consequence.pal) +
+  labs(x = '', y = 'SNVs per kb', fill = '') +
+  facet_grid(cat ~ gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(panel.grid = element_blank())
+```
+
+Plot mean depth vs no. SNVs for each sample. 
+
+```{r lofreq_depth_vs_nosnvs}
+nosnvs <- as.data.frame(table(snvs$cat, snvs$tissue))
+nosnvs <- nosnvs[order(nosnvs$Var1),]
+
+# store coverage stats from earlier and combine with snv counts
+snvstats <- cov.df
+snvstats$snvs <- nosnvs$Freq[-c(2,14)]
+
+library(ggplot2)
+library(ggsci)
+library(viridis)
+
+cat.pal = viridis(n = 5, option = 'turbo')
+
+snv.stats.gg <- ggplot(snvstats, aes(log10(meandepth), snvs)) +
+  # geom_smooth() +
+  geom_point(aes(colour = cat, shape = tissue), size = 2.5) +
+  scale_color_manual(values = cat.pal) +
+  # geom_vline(xintercept = log10(500), color = 'black', lty = 'dashed') +
+  labs(x = expression(log[10]*' mean depth'), y = 'Number of SNVs', color = 'Cat', shape = 'Tissue') + 
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Plot distribution of allele frequencies across tissues.
+
+```{r lofreq_snv_freqdist}
+library(ggplot2)
+
+# remove 37 and 96 (not enough snvs)
+vars4 <- droplevels(vars3[vars3$cat %in% c("68", "86", "120", "172"),])
+vars4$cat <- factor(vars4$cat, levels = c('120', '172', '68', '86'))
+vars4$tissue <- factor(vars4$tissue, levels = c('MLN', 'Liver', 'Lung'))
+
+ggplot(vars4, aes(AF, fill = tissue)) +
+  geom_histogram(bins = 60) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,125)) +
+  facet_wrap(vars(cat), nrow = 1) +
+  scale_fill_manual(values = tissue.pal[c(3,1,2)]) +
+  labs(x = 'AAF', y = 'No. variants', fill = 'Tissue') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Stability of variant calls - downsampling
+
+Downsampled the 4 samples with highest mean depth (MLN from 68, 86, 120 and 172) to fixed mean depths (2000x - except 120, 1000x, 500x, 200x, 100x, 50x) using `samtools view` with `-s` and the value for [target_downsampled_depth / mean_depth] and called variants using lofreq with the same settings as for the main analysis. After filtering, see how many of the variants called with all reads are retained at each depth. 
+
+```{r lofreq_downsampling}
+library(ggplot2)
+
+# read in data
+ds.vars.list <- list.files(path = 'mln_aln/lofreq/downsampled', 
+                        pattern = '*\\.txt',
+                        full.names = TRUE)
+ds.vars.names <- list.files(path = 'mln_aln/lofreq/downsampled', 
+                        pattern = '*\\.txt',
+                        full.names = FALSE)
+ds.vars.names <- stringr::str_remove(ds.vars.names, '.txt')
+
+dsvars1 <- vector("list", length(ds.vars.list))
+for(i in seq_along(ds.vars.list)) {
+  y <- suppressMessages(readr::read_delim(ds.vars.list[i], delim = '\t', col_names = TRUE))
+  dsvars1[[i]] <- y
+  dsvars1[[i]]$SAMPLE <- ds.vars.names[i]
+}
+names(dsvars1) <- ds.vars.names
+
+# add depth and cat id for splitting
+dsid <- stringr::str_remove(ds.vars.names, 'feline_fip_')
+dsid <- stringr::str_remove(dsid, '_snpeff')
+depth <- stringr::str_remove(dsid, '[0-9].*_mln.')
+dscat <- stringr::str_remove(dsid, '_.*')
+
+dsvars1 <- mapply(cbind, dsvars1, "cat"=dscat, "depth"=depth, SIMPLIFY = FALSE)
+
+# merge variants
+dsvars2 <- Reduce(function(...) merge(..., all = TRUE), dsvars1)
+
+# split DP4 column into separate fields - ref-forward bases, ref-reverse, alt-forward and alt-reverse
+dsvars2[c('DP_REF_FWD', 'DP_REF_REV', 'DP_ALT_FWD', 'DP_ALT_REV')] <- stringr::str_split_fixed(dsvars2$DP4, ';', 4)
+
+# filter variants in 5' and 3' UTRs
+dsvars3 <- dsvars2[dsvars2$POS < 28968 & dsvars2$POS > 260,]
+
+# filter variants < 2%
+dsvars3 <- dsvars3[dsvars3$AF >= 0.02,]
+table(dsvars3$cat, dsvars3$depth)
+
+# filter variants with < 5 ALT reads
+dsvars3$DP_ALT <- as.numeric(dsvars3$DP_ALT_FWD) + as.numeric(dsvars3$DP_ALT_REV)
+dsvars3 <- dsvars3[dsvars3$DP_ALT >= 5,]
+ds.snv.tab <- table(dsvars3$cat, dsvars3$depth)
+
+# divide downsampled snv counts by no. variants with all reads
+norm.dsvars <- data.frame(rbind(ds.snv.tab / c(87, 491, 154, 81)))
+norm.dsvars <- norm.dsvars[,c('X2000x', 'X1000x', 'X500x', 'X200x', 'X100x', 'X50x')]
+norm.dsvars$Cat <- rownames(norm.dsvars)
+colnames(norm.dsvars) <- c('2000x', '1000x', '500x', '200x', '100x', '50x', 'Cat')
+# set 0 to na
+norm.dsvars[norm.dsvars == 0] <- NA
+
+norm.dsvars.melt <- reshape2::melt(norm.dsvars, id = 'Cat')
+
+ds.box.gg <- ggplot(norm.dsvars.melt, aes(x = variable, y = value)) +
+  geom_boxplot(fill = NA, color = 'darkgrey', outlier.shape = NA) +
+  geom_point(aes(color = Cat), position = position_jitter(width = 0.1, height = 0), size = 2) +
+  geom_hline(yintercept = 1, color = 'black', lty = 'dashed') +
+  scale_y_continuous(expand = c(0,0), limits = c(0,2), breaks = seq(0,2,0.5)) +
+  scale_color_manual(values = cat.pal[1:4]) +
+  labs(x = 'Mean depth after downsampling', y = 'Variants identified / variants at max depth') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Mutation spectrum
+
+```{r lofreq_mutation_spectrum}
+library(ggplot2)
+
+# look at types of mutations and their frequencies
+snvs <- vars3[nchar(vars3$REF) == 1 & nchar(vars3$ALT) == 1,]
+snvs$mutation <- paste(snvs$REF,'>', snvs$ALT, sep = '')
+
+# remove 37 and 96 (not enough snvs)
+snvs <- droplevels(snvs[snvs$cat %in% c("68", "86", "120", "172"),])
+
+# remove UTR variants
+snvs <- snvs[!snvs$`ANN[*].GENE` == '.', ]
+
+# summarise as proportion of variants for each type, and plot all cats together
+# first, set mutation order
+snvs$mutation <- factor(snvs$mutation, levels = c('C>A', 'G>T', 'C>G', 'G>C', 'C>T', 'G>A', 'T>A', 'A>T', 'T>C', 'A>G', 'T>G', 'A>C'))
+
+snvs.summ <- snvs %>%
+  group_by(cat, mutation) %>%
+  summarise(n = n()) %>%
+  complete(mutation = levels(snvs$mutation), fill = list(n = 0)) %>%
+  mutate(freq = n/sum(n), .keep = 'all') 
+
+snvs.summ$mutation <- factor(snvs.summ$mutation, levels = levels(snvs$mutation))
+
+snvs.summ$group <- rep(c('T>G', 'T>C', 'T>A', 'C>A', 'C>G', 'C>T', 'C>T', 'C>G', 'C>A', 'T>A', 'T>C', 'T>G'), 4)
+snvs.summ$strand <- rep(c(rep('rev', 3), rep('fwd', 3)), 8)
+
+# cast to matrix and combine with mean data
+snvs.cast <- reshape2::acast(snvs.summ, mutation~cat, value.var = 'freq')
+
+snvs.mean <- snvs.summ %>%
+  group_by(mutation) %>%
+  summarise(meanfreq = mean(freq), sdfreq = sd(freq))
+
+snvs.mean$group <- c(rep('C>A', 2), rep('C>G', 2), rep('C>T', 2), rep('T>A', 2), rep('T>C', 2), rep('T>G', 2))
+snvs.mean$strand <- rep(c('fwd', 'rev'), 6)
+
+snvs.comb <- cbind(snvs.mean, snvs.cast)
+
+# melt for plotting
+snvs.melt <- reshape2::melt(snvs.comb, id.vars = c('mutation', 'meanfreq', 'sdfreq', 'group', 'strand'))
+
+ggplot(snvs.melt, aes(group, meanfreq, group = strand, color = variable)) +
+  geom_bar(aes(fill = strand), stat = 'identity', position = 'dodge', color = NA) +
+  geom_errorbar(aes(ymin = meanfreq-sdfreq, ymax = meanfreq+sdfreq), position = position_dodge(0.9), width = 0.2, color = 'black') +
+  geom_point(aes(x = group, y = value), position = position_jitterdodge(dodge.width = 0.9, jitter.width = 0.1)) +
+  scale_color_manual(values = cat.pal) +
+  scale_fill_manual(values = c('lightgray', 'darkgrey')) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.3), breaks = seq(0,0.3,0.05)) +
+  labs(x = 'Mutation type (plus strand)', y = 'Mutation frequency', color = 'Cat', fill = 'Strand') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Selection analysis
+
+Using the [dndscv](https://github.com/im3sanger/dndscv) package to get gene-level estimates of selection.  
+
+```{r dndscv_selection}
+# following the tutorial for building refs and estimating selection pressure - note the tutorial is for human data, but the tool has been used for SARS-CoV-2 data in this paper: https://elifesciences.org/articles/66857#s4
+library(dndscv)
+
+# start with 86_mln
+# create CDS table to use as input (based on GFF from Prodigal)
+# note - cds must be divisible by 3
+# https://github.com/im3sanger/dndscv/issues/55
+buildref(cdsfile='dndscv/tx_tables/fip_86_mln.txt', genomefile='dndscv/feline_fip_86_mln.fa', outfile = 'dndscv/refcds/fip_86_mln.rda', numcode = 11)
+
+# inspect ref
+load('dndscv/refcds/fip_86_mln.rda')
+# looks fine
+
+# create variant table for 86mln
+mut.86mln <- subset(vars3[vars3$SAMPLE == 'feline_fip_86_mln',], select = c(SAMPLE, CHROM, POS, REF, ALT))
+colnames(mut.86mln) <- c('sampleID', 'chr', 'pos', 'ref', 'mut')
+
+# run dndscv
+dndscv.86mln <- dndscv(mut.86mln, refdb = 'dndscv/refcds/fip_86_mln.rda', numcode = 11, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf, cv = NULL)
+
+# now try all tissues for cat 86
+mut.86 <- subset(vars3[vars3$CHROM == 'feline_fip_86_mln',], select = c(SAMPLE, CHROM, POS, REF, ALT))
+colnames(mut.86) <- c('sampleID', 'chr', 'pos', 'ref', 'mut')
+
+# filter shared variants
+mut.86.dedup <- mut.86 %>%
+  distinct(pos, mut, .keep_all = TRUE)
+
+# run dndscv
+dndscv.86 <- dndscv(mut.86.dedup, refdb = 'dndscv/refcds/fip_86_mln.rda', sm = '192r_3w', numcode = 11, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf, outmats = TRUE, constrain_wnon_wspl = TRUE)
+
+# add missing line to mle_submodel
+dndscv.86$mle_submodel[nrow(dndscv.86$mle_submodel)+1,] = list('wspl', 7.547607e-02, 0.0181692282, 0.31353214)
+
+ci.86 <- geneci(dndscv.86)
+ci.86$gene <- factor(ci.86$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+
+ggplot(ci.86, aes(gene, mis_mle)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(x = gene, ymin = mis_low, ymax = mis_high), width = 0.2) +
+  theme_bw()
+
+# now 68_mln
+# create CDS table to use as input
+# check that CDSs are divisible by 3
+buildref(cdsfile='dndscv/tx_tables/fip_68_mln.txt', genomefile='dndscv/feline_fip_68_mln.fa', outfile = 'dndscv/refcds/fip_68_mln.rda', numcode = 11)
+
+# now try all tissues for cat 68
+mut.68 <- subset(vars3[vars3$CHROM == 'feline_fip_68_mln',], select = c(SAMPLE, CHROM, POS, REF, ALT))
+colnames(mut.68) <- c('sampleID', 'chr', 'pos', 'ref', 'mut')
+
+# filter shared variants
+mut.68.dedup <- mut.68 %>%
+  distinct(pos, mut, .keep_all = TRUE)
+
+# run dndscv
+dndscv.68 <- dndscv(mut.68.dedup, refdb = 'dndscv/refcds/fip_68_mln.rda', sm = '192r_3w', numcode = 11, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf, outmats = TRUE, constrain_wnon_wspl = TRUE)
+
+# add missing line to mle_submodel
+dndscv.68$mle_submodel[nrow(dndscv.68$mle_submodel)+1,] = list('wspl', 7.547607e-02, 0.0181692282, 0.31353214)
+
+ci.68 <- geneci(dndscv.68)
+ci.68$gene <- factor(ci.68$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+
+ggplot(ci.68, aes(gene, mis_mle)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(x = gene, ymin = mis_low, ymax = mis_high), width = 0.2) +
+  theme_bw()
+
+# 120_mln
+# create CDS table to use as input
+# check that CDSs are divisible by 3
+buildref(cdsfile='dndscv/tx_tables/fip_120_mln.txt', genomefile='dndscv/feline_fip_120_mln.fa', outfile = 'dndscv/refcds/fip_120_mln.rda', numcode = 11)
+
+# now try all tissues for cat 120
+mut.120 <- subset(vars3[vars3$CHROM == 'feline_fip_120_mln',], select = c(SAMPLE, CHROM, POS, REF, ALT))
+colnames(mut.120) <- c('sampleID', 'chr', 'pos', 'ref', 'mut')
+
+# filter shared variants
+mut.120.dedup <- mut.120 %>%
+  distinct(pos, mut, .keep_all = TRUE)
+
+# run dndscv
+dndscv.120 <- dndscv(mut.120.dedup, refdb = 'dndscv/refcds/fip_120_mln.rda', sm = '192r_3w', numcode = 11, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf, outmats = TRUE, constrain_wnon_wspl = TRUE)
+
+# add missing line to mle_submodel
+dndscv.120$mle_submodel[nrow(dndscv.120$mle_submodel)+1,] = list('wspl', 7.547607e-02, 0.0181692282, 0.31353214)
+
+ci.120 <- geneci(dndscv.120)
+ci.120$gene <- factor(ci.120$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+
+ggplot(ci.120, aes(gene, mis_mle)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(x = gene, ymin = mis_low, ymax = mis_high), width = 0.2) +
+  theme_bw()
+
+# 172_mln
+# create CDS table to use as input
+# check that CDSs are divisible by 3
+buildref(cdsfile='dndscv/tx_tables/fip_172_mln.txt', genomefile='dndscv/feline_fip_172_mln.fa', outfile = 'dndscv/refcds/fip_172_mln.rda', numcode = 11)
+
+# now try all tissues for cat 172
+mut.172 <- subset(vars3[vars3$CHROM == 'feline_fip_172_mln',], select = c(SAMPLE, CHROM, POS, REF, ALT))
+colnames(mut.172) <- c('sampleID', 'chr', 'pos', 'ref', 'mut')
+
+# filter shared variants
+mut.172.dedup <- mut.172 %>%
+  distinct(pos, mut, .keep_all = TRUE)
+
+# run dndscv
+dndscv.172 <- dndscv(mut.172.dedup, refdb = 'dndscv/refcds/fip_172_mln.rda', sm = '192r_3w', numcode = 11, max_muts_per_gene_per_sample = Inf, max_coding_muts_per_sample = Inf, outmats = TRUE, constrain_wnon_wspl = TRUE)
+
+# add missing line to mle_submodel
+dndscv.172$mle_submodel[nrow(dndscv.172$mle_submodel)+1,] = list('wspl', 7.547607e-02, 0.0181692282, 0.31353214)
+
+ci.172 <- geneci(dndscv.172)
+ci.172$gene <- factor(ci.172$gene, levels = c('ORF1a', 'ORF1b', 'S', '3a', '3b', '3c', 'E', 'M', 'N', '7a', '7b'))
+
+ggplot(ci.172, aes(gene, mis_mle)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(x = gene, ymin = mis_low, ymax = mis_high), width = 0.2) +
+  theme_bw()
+
+# combine global selection scores for plotting
+dndscv.all <- list(dndscv.68$globaldnds, dndscv.86$globaldnds, dndscv.120$globaldnds, dndscv.172$globaldnds)
+names(dndscv.all) <- c('68', '86', '120', '172')
+
+dndscv.df <- bind_rows(dndscv.all, .id = 'Cat')
+
+# remove NAs, wtru and wall
+dndscv.df <- dndscv.df[dndscv.df$name %in% c('wmis', 'wnon'),]
+
+# plot
+ggplot(dndscv.df, aes(Cat, mle, fill = name)) +
+  geom_bar(stat="identity",position=position_dodge(0.9,preserve='single')) + 
+  geom_errorbar(stat='identity',aes(ymin=cilow, ymax=cihigh), position=position_dodge(0.9, preserve = "single"),width=0.2) +
+  geom_hline(yintercept = 1, lty = 'dashed', color = 'black') +
+  scale_fill_manual(values = c('lightgray', 'darkgrey')) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1.5), breaks = seq(0,1.5,0.25)) +
+  labs(x = 'Cat', y = 'dN/dS', fill = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+
+# combine data for ORF1a, ORF1b, S and N for each cat, and produce grouped plot
+ci.all <- list(ci.68, ci.86, ci.120, ci.172)
+names(ci.all) <- c('68', '86', '120', '172')
+
+ci.df <- bind_rows(ci.all, .id = 'Cat')
+
+ci.df.filt <- ci.df[ci.df$gene %in% c('ORF1a', 'ORF1b', 'S', 'N'),]
+ci.df.filt$gene <- factor(ci.df.filt$gene, levels = c('ORF1a', 'ORF1b', 'S', 'N'))
+
+ggplot(ci.df.filt, aes(gene, mis_mle, fill = Cat)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(gene, ymin = mis_low, ymax = mis_high), width = 0.2, color = 'black') +
+  geom_hline(yintercept = 1, lty = 'dashed', color = 'black') +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 2)) +
+  scale_fill_manual(values = cat.pal) +
+  facet_wrap(vars(Cat), nrow = 1) +
+  labs(x = '', y = 'dN/dS (missense variants)') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# plot for alt genes - M and ORF7b
+ci.df.filt2 <- ci.df[ci.df$gene %in% c('M', '7b'),]
+ci.df.filt2$gene <- factor(ci.df.filt2$gene, levels = c('M', '7b'))
+
+ggplot(ci.df.filt2, aes(gene, mis_mle, fill = Cat)) +
+  geom_bar(stat = 'identity') +
+  geom_errorbar(aes(gene, ymin = mis_low, ymax = mis_high), width = 0.2, color = 'black') +
+  geom_hline(yintercept = 1, lty = 'dashed', color = 'black') +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 5)) +
+  scale_fill_manual(values = cat.pal) +
+  facet_wrap(vars(Cat), nrow = 1) +
+  labs(x = '', y = 'dN/dS (missense variants)') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# trinucleotide seq context
+library(ggseqlogo)
+
+trinuc.86 <- dndscv.86$annotmuts
+trinuc.86$sub <- paste0(trinuc.86$ref, '>', trinuc.86$mut)
+# remove indels
+trinuc.86 <- trinuc.86[nchar(trinuc.86$sub) == 3,]
+
+ggplot(trinuc.86[trinuc.86$sub %in% c('C>T'),], aes(ref3_cod)) +
+  geom_bar(stat = 'count') +
+  # facet_wrap(vars(sampleID), scales = 'free_x', nrow = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+trinuc.68 <- dndscv.68$annotmuts
+trinuc.68$sub <- paste0(trinuc.68$ref, '>', trinuc.68$mut)
+# remove indels
+trinuc.68 <- trinuc.68[nchar(trinuc.68$sub) == 3,]
+
+ggplot(trinuc.68[trinuc.68$sub %in% c('C>T'),], aes(ref3_cod)) +
+  geom_bar(stat = 'count') +
+  # facet_wrap(vars(sampleID), scales = 'free_x', nrow = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+trinuc.172 <- dndscv.172$annotmuts
+trinuc.172$sub <- paste0(trinuc.172$ref, '>', trinuc.172$mut)
+# remove indels
+trinuc.172 <- trinuc.172[nchar(trinuc.172$sub) == 3,]
+
+ggplot(trinuc.172[trinuc.172$sub %in% c('C>T'),], aes(ref3_cod)) +
+  geom_bar(stat = 'count') +
+  # facet_wrap(vars(sampleID), scales = 'free_x', nrow = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+trinuc.120 <- dndscv.120$annotmuts
+trinuc.120$sub <- paste0(trinuc.120$ref, '>', trinuc.120$mut)
+# remove indels
+trinuc.120 <- trinuc.120[nchar(trinuc.120$sub) == 3,]
+
+ggplot(trinuc.120[trinuc.120$sub %in% c('C>T'),], aes(ref3_cod)) +
+  geom_bar(stat = 'count') +
+  # facet_wrap(vars(sub), scales = 'free_x', nrow = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# combine data and plot summary
+trinuc.all <- list(trinuc.68, trinuc.86, trinuc.120, trinuc.172)
+names(trinuc.all) <- c('68', '86', '120', '172')
+trinuc.df <- bind_rows(trinuc.all, .id = 'Cat')
+
+# subset C>T mutations
+ct.df <- trinuc.df[trinuc.df$sub == 'C>T',]
+
+ct.summ <- ct.df %>%
+  group_by(Cat, ref3_cod) %>%
+  summarise(count = n()) %>%
+  complete(ref3_cod = unique(ct.df$ref3_cod), fill = list(count = 0)) %>%
+  mutate(prop = count/sum(count))
+
+ggplot(ct.summ, aes(ref3_cod, prop, fill = Cat)) +
+  geom_bar(stat = 'identity', show.legend = F) +
+  scale_fill_manual(values = cat.pal) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.3), breaks = seq(0,0.3,0.05)) +
+  labs(x = 'Trinucleotide sequence context', y = 'Proportion of C>T mutations') +
+  facet_wrap(vars(Cat), nrow = 2) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# seqlogos
+ggseqlogo(trinuc.86[trinuc.86$sub %in% c('C>T'),]$ref3_cod, method = 'probability')
+ggseqlogo(trinuc.68[trinuc.68$sub %in% c('C>T'),]$ref3_cod, method = 'probability')
+ggseqlogo(trinuc.172[trinuc.172$sub %in% c('C>T'),]$ref3_cod, method = 'probability')
+ggseqlogo(trinuc.120[trinuc.120$sub %in% c('C>T'),]$ref3_cod, method = 'probability')
+
+# all C>T
+ggseqlogo(c(trinuc.86[trinuc.86$sub %in% c('C>T'),]$ref3_cod,
+            trinuc.68[trinuc.68$sub %in% c('C>T'),]$ref3_cod,
+            trinuc.172[trinuc.172$sub %in% c('C>T'),]$ref3_cod,
+            trinuc.120[trinuc.120$sub %in% c('C>T'),]$ref3_cod),
+          method = 'probability')
+```
+
+## Cross-tissue variants
+
+Look at variants in specific genes (mainly S and M) shared by FCoV isolates from different tissues of the same cat.  
+
+```{r lofreq_genefocus}
+# plot shared vars only, for specific genes
+# get SNVs detected in > 1 tissue (this also retains multiallelic SNVs)
+vars.shared <- vars3 %>%
+  filter(`ANN[*].EFFECT` %in% c('missense_variant', 'stop_gained')) %>%
+  group_by(cat, POS, ALT) %>%
+  filter(n() > 1 | tissue != 'MLN' & AF > 0.5) %>%
+  ungroup()
+
+# alternative filter that does not retain variants with AF > 0.5 in a non-MLN tissue (so only shared variants plotted)
+vars.shared2 <- vars3 %>%
+  filter(`ANN[*].EFFECT` %in% c('missense_variant', 'stop_gained')) %>%
+  group_by(cat, POS, ALT) %>%
+  filter(n() > 1) %>%
+  group_by(POS, ALT, `ANN[*].GENE`) %>%
+  filter(n() != 1) %>%
+  ungroup()
+
+vars.shared2$tissue <- factor(vars.shared2$tissue, levels = c('MLN', 'Lung', 'Liver'))
+
+# plot changes in AF between tissues
+ggplot(vars.shared2, aes(tissue, AF)) +
+  geom_boxplot(aes(group = tissue), outlier.shape = NA) +
+  geom_point(aes(color = tissue, group = POS)) +
+  geom_line(aes(group = POS), color = 'darkgrey', alpha = 0.3) +
+  scale_color_manual(values = tissue.pal[c(3,2,1)]) +
+  facet_wrap(vars(cat), nrow = 1) +
+  labs(x = '', y = 'AAF (cross-tissue variants)') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# S/Spike
+vars.shared.spike <- vars.shared[vars.shared$`ANN[*].GENE` == 'S',]
+vars.shared.spike$`ANN[*].AA_POS` <- as.numeric(vars.shared.spike$`ANN[*].AA_POS`)
+vars.shared.spike.ns <- vars.shared.spike[vars.shared.spike$`ANN[*].EFFECT` == 'missense_variant',]
+write.table(vars.shared.spike.ns, file = 'vars_shared_spike_ns.txt', sep = '\t')
+
+# correct AA positions based on alignment of the MLN spike seqs
+# load in the corrected data and plot
+vars.shared.spike.ns.corr <- read.csv('vars_shared_spike_ns_corrected.txt', sep = '\t', header = TRUE)
+
+s.vars.gg <- ggplot(vars.shared.spike.ns.corr, aes(as.numeric(ANN....AA_POS_CORR), AF, colour = tissue)) +
+  geom_point() +
+  # geom_vline(xintercept = c(275, 540, 695, 800, 942, 1055, 1156), color = 'black', lty = 'dashed') +
+  scale_color_manual(values = tissue.pal) +
+  facet_wrap(vars(cat), ncol = 1) +
+  scale_x_continuous(expand = c(0,0), limits = c(0,1467), breaks = seq(0,1400,200)) +
+  labs(x = '', y = 'Alternate allele frequency', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank())
+
+# plot density of variants by codon position
+library(GenomicRanges)
+
+# first, get corrected codon positions of all SNVs - export and correct
+# write.table(vars3[vars3$`ANN[*].GENE` == 'S',], file = 'all_vars_spike.txt', sep = '\t')
+
+# read in corrected variants
+all.vars.spike <- read.csv('all_vars_spike_corrected.txt', sep = '\t', header = TRUE)
+
+# save as GRanges
+s.snvs <- GRanges("S", IRanges(all.vars.spike$ANN....AA_POS_CORR, width=1))
+s.cvg <- coverage(s.snvs)
+s.r <- runsum(s.cvg, 10)
+
+s.r.df <- as(s.r$S, 'data.frame')
+s.r.df$pos <- as.numeric(rownames(s.r.df))
+colnames(s.r.df) <- c('snvs', 'pos')
+
+s.dens.gg <- ggplot(s.r.df, aes(pos, snvs)) +
+  geom_line(color = '#D52D23', linewidth = 0.6) +
+  labs(x = '', y = 'No. SNVs') +
+  scale_x_continuous(expand = c(0,0), limits = c(0,1467)) +
+  theme_bw()
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank())
+
+# plot positions of spike domains
+# need to make gff of spike domains based on PDB 6JX7
+library(rtracklayer)
+
+spike.gff <- import.gff3('spike_domains_pdb6JX7_forGFF.gff')
+spike.domain.names <- spike.gff$ID
+spike.df <- as.data.frame(spike.gff)
+
+spike.domains <- ggplot(spike.df) +
+  geom_segment(aes(x = start, xend = end, y = 1, yend = 1), linewidth = 6, colour = 'darkgrey') +
+  geom_text(aes(x = (start+end)/2, y = 1, label = ID), colour = 'black', size = 2.5) +
+  scale_y_continuous(limits = c(0,3)) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(0,1500,200), limits = c(0, 1467)) +
+  labs(x = 'Codon position in Spike alignment', y = '') +
+  theme_bw() +
+  theme(legend.position = 'none',
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        plot.margin = margin(t = 0, r = 5, b = 5, l = 5),
+        panel.grid = element_blank())
+
+# combine plots
+cowplot::plot_grid(s.dens.gg, s.vars.gg, spike.domains, ncol = 1, axis = 'lrtb', align = 'v', rel_heights = c(0.2,1, 0.2))
+
+# select HR1 mutations for annotation of structural models
+vars.hr1 <- vars.shared.spike.ns.corr[vars.shared.spike.ns.corr$ANN....AA_POS_CORR >= 1100 & vars.shared.spike.ns.corr$ANN....AA_POS_CORR < 1120,]
+
+# read in AF matrix and plot hmap for main figure
+hr1.mat <- read.csv('hr1mut_af_mat.txt', sep = '\t', row.names = 1)
+
+library(pheatmap)
+library(RColorBrewer)
+breaks = seq(0,1,0.01)
+hmcols = colorRampPalette(rev(c("#bd0026", "#f03b20", "#fd8d3c", "#fecc5c", "#ffffb2")))(length(breaks)-1)
+
+pheatmap(hr1.mat, color = hmcols, breaks = breaks, cluster_rows = FALSE, cluster_cols = FALSE,
+         gaps_col = c(1,4,6), show_colnames = FALSE, cellheight = 15, cellwidth = 15)
+
+# M/Membrane
+vars.shared.membrane <- vars.shared[vars.shared$`ANN[*].GENE` == 'M',]
+vars.shared.membrane$`ANN[*].AA_POS` <- as.numeric(vars.shared.membrane$`ANN[*].AA_POS`)
+vars.shared.membrane.ns <- vars.shared.membrane[vars.shared.membrane$`ANN[*].EFFECT` == 'missense_variant',]
+# write.table(vars.shared.membrane.ns, file = 'vars_shared_membrane_ns.txt', sep = '\t')
+
+# correct AA positions based on alignment of the MLN membrane seqs
+# load in the corrected data and plot
+vars.shared.membrane.ns.corr <- read.csv('vars_shared_membrane_ns_corrected.txt', sep = '\t', header = TRUE)
+
+m.vars.gg <- ggplot(vars.shared.membrane.ns.corr, aes(ANN....AA_POS_CORR, AF, colour = tissue)) +
+  geom_point() +
+  # geom_vline(xintercept = c(275, 540, 695, 800, 942, 1055, 1156), color = 'black', lty = 'dashed') +
+  scale_color_manual(values = tissue.pal) +
+  facet_wrap(vars(cat), ncol = 1) +
+  scale_x_continuous(expand = c(0,0), limits = c(0,274), breaks = seq(0,274,50)) +
+  labs(x = '', y = 'Alternate allele frequency', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank())
+
+# plot density of variants by codon position
+# write.table(vars3[vars3$`ANN[*].GENE` == 'M',], file = 'all_vars_membrane.txt', sep = '\t')
+
+# read in corrected variants
+all.vars.membrane <- read.csv('all_vars_membrane_corrected.txt', sep = '\t', header = TRUE)
+
+# save as GRanges
+m.snvs <- GRanges("M", IRanges(as.numeric(all.vars.membrane$ANN....AA_POS_CORR), width=1))
+m.cvg <- coverage(m.snvs)
+m.r <- runsum(m.cvg, 10)
+
+m.r.df <- as(m.r$M, 'data.frame')
+m.r.df$pos <- as.numeric(rownames(m.r.df))
+colnames(m.r.df) <- c('snvs', 'pos')
+# append positions with no snvs
+m.r.df.add <- data.frame(snvs = c(rep(1, 9), rep(0,20)), pos = seq(246,274,1))
+m.r.df <- rbind(m.r.df, m.r.df.add)
+
+m.dens.gg <- ggplot(m.r.df, aes(pos, snvs)) +
+  geom_line(color = '#D52D23', linewidth = 0.6) +
+  labs(x = '', y = 'No. SNVs') +
+  scale_x_continuous(expand = c(0,0), limits = c(0,274), breaks = seq(0,300,50)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank())
+
+# plot positions of membrane domains
+# need to make gff of membrane domains based on alignment with SARS-CoV-2 membrane protein
+library(rtracklayer)
+
+membrane.gff <- import.gff3('membrane_domains_alphafold_forGFF.gff')
+membrane.domain.names <- membrane.gff$ID
+membrane.df <- as.data.frame(membrane.gff)
+
+membrane.domains <- ggplot(membrane.df) +
+  geom_segment(aes(x = start, xend = end, y = 1, yend = 1), linewidth = 6, colour = 'darkgrey') +
+  geom_text(aes(x = (start+end)/2, y = 1, label = ID), colour = 'black', size = 2.5) +
+  scale_y_continuous(limits = c(0,3)) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(0,300,50), limits = c(0, 274)) +
+  labs(x = 'Codon position in Membrane alignment', y = '') +
+  theme_bw() +
+  theme(legend.position = 'none',
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        plot.margin = margin(t = 0, r = 5, b = 5, l = 5),
+        panel.grid = element_blank())
+
+# combine plots
+cowplot::plot_grid(m.dens.gg, m.vars.gg, membrane.domains, ncol = 1, axis = 'lrtb', align = 'v', rel_heights = c(0.2,1, 0.2))
+```

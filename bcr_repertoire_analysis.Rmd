@@ -1,0 +1,2865 @@
+---
+title: "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire - BCR repertoire analysis pipeline"
+author: "Tom Hiron"
+date: "2026"
+output: 
+  html_document:
+    theme: "simplex"
+    toc: true
+    toc_float: true
+    highlight: kate
+    code_folding: show
+    self_contained: true
+---
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, 
+                      message = FALSE, 
+                      echo = TRUE, 
+                      eval = TRUE,
+                      fig.path = 'figures/',
+                      fig.ext = 'png',
+                      cache = FALSE,
+                      cache.path = 'cache/')
+```
+
+Pipeline to reproduce B Cell Receptor (BCR) repertoire analysis in the manuscript "Fatal consequences of feline coronavirus infection are associated with virus persistence and a distinct adaptive immune repertoire", Hiron et al. 2025, https://www.biorxiv.org/content/10.1101/2025.10.02.679983v1.
+
+## Data availability
+
+Sequencing data supporting the findings of this study have been deposited in the National Center for Biotechnology Information (NCBI) Sequence Read Archive under BioProject ID PRJNA1330231.
+
+## Preparation of feline V(D)J sequence libraries
+
+Created custom library from de novo search and rearranged BCR chains from Lu et al 2017.
+
+IGHV genes: [IgDetective](https://github.com/Immunotools/IgDetective) and manual annotation of fca126 chrB3 using predicted 7mer_23bp_9mer positions. 
+IGHJ genes: [StochHMM](https://github.com/KorfLab/StochHMM) on fca126 chrB3 with the J gene model included in the supplementary information of this paper: (https://www.sciencedirect.com/science/article/pii/S0165242718300941?via%3Dihub)
+IGHD genes: [StochHMM](https://github.com/KorfLab/StochHMM) on fca126 chrB3 with the D gene model also included in the supplementary information of the above paper.
+IGHC genes: Derived from sequences in [Lu et al 2017](https://www.nature.com/articles/s41598-017-12725-5), and from BLAST searches of canine IGHC regions against fca126. 
+
+For this version of the reference library, an additional 5 IGHV genes detected by BLAST search of previously detected IGHV alleles against fca126 are included. This was done due to the presence of quite distant alleles (detected with MiXCR's findAlleles) detected in the rearranged IGH sequences during preliminary analysis. Some distant alleles did not map to new genes, so there may still be additional IGHV genes not found due to absence from fca126 (either due to assembly errors or structural variation). 
+
+IGH gene FASTAs used as follows to prepare custom reference library in [MiXCR](https://mixcr.com/mixcr/guides/create-custom-library/):
+
+```{r mixcr_custom_lib, engine = 'bash', eval = FALSE}
+mixcr buildLibrary --debug \
+  --v-genes-from-fasta IGHV.fa \
+  --v-gene-feature VRegion \
+  --j-genes-from-fasta IGHJ.fa \
+  --d-genes-from-fasta IGHD.fa \
+  --c-genes-from-fasta IGHC.fa \
+  --chain IGH \
+  --taxon-id 9685 \
+  --species cat \
+  feline-IGH.json.gz
+```
+
+## Assembly of IGH clonotypes from RNA-seq samples with MiXCR
+
+MiXCR v4.7.0.
+
+```{r mixcr_assemble_rnaseq_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J mixcr_igh_rnaseq_secondary.job 
+#SBATCH -o mixcr_igh_rnaseq_secondary.%A_%a.out 
+#SBATCH -c 4
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+inpath=fastq
+outpath=mixcr/igh
+
+cd $inpath
+
+fastqs=()
+for fastq in *_1.fastq.gz
+do
+        fastq=${fastq%_1.fastq.gz}
+        fastqs[${#fastqs[@]}]=$fastq
+done
+
+cd $path
+
+#put task here
+file1=$inpath/${fastqs[$i]}_1.fastq.gz
+file2=$inpath/${fastqs[$i]}_2.fastq.gz
+outpath=$outpath/${fastqs[$i]}
+
+mixcr analyze rna-seq -t 4 \
+    --species cat \
+    --library feline-IGH.json.gz \
+    $file1 \
+    $file2 \
+    $outpath
+```
+
+```{r mixcr_assemble_rnaseq_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+path=`pwd`
+inpath=fastq
+
+cd $inpath
+
+fastqs=()
+for fastq in *_1.fastq.gz
+do
+        fastq=${fastq%_1.fastq.gz}
+        fastqs[${#fastqs[@]}]=$fastq
+done
+fastqcount=${#fastqs[@]}
+
+cd $path
+
+sbatch --array 1-$fastqcount:1 mixcr_assemble_rnaseq_secondary.sh
+```
+
+## Clonotype analysis
+
+Immunarch (https://immunarch.com/).
+
+Load MiXCR data.
+
+```{r immunarch_load}
+library(immunarch)
+library(stringr)
+
+igh_mixcr <- repLoad('mixcr/IGH/')
+
+# set metadata and sample names
+igh_mixcr$meta$Sample <- names(igh_mixcr$data)
+sampleGroups <- factor(c(rep('Control', 21), rep('FIP', 21)), levels = c('Control', 'FIP'))
+
+names(igh_mixcr$data) <- str_remove(names(igh_mixcr$data), 'feline_')
+names(igh_mixcr$data) <- str_remove(names(igh_mixcr$data), '_merged')
+names(igh_mixcr$data) <- str_remove(names(igh_mixcr$data), '.clones_IGH')
+
+igh_mixcr$meta$Group <- sampleGroups
+
+igh_mixcr$meta$Sample <- str_remove(igh_mixcr$meta$Sample, 'feline_')
+igh_mixcr$meta$Sample <- str_remove(igh_mixcr$meta$Sample, '_merged')
+igh_mixcr$meta$Sample <- str_remove(igh_mixcr$meta$Sample, '.clones_IGH')
+
+# add tissue to metadata
+igh_mixcr$meta$Tissue <- ifelse(grepl('liver', igh_mixcr$meta$Sample), 'Liver', ifelse(grepl('lung', igh_mixcr$meta$Sample), 'Lung', 'MLN'))
+```
+
+## Clone and clonotype stats - all tissues
+
+```{r immunarch_basic}
+# first, plot the number of clones detected in each sample, faceted by tissue
+igh.clns <- data.frame(lapply(igh_mixcr$data, function(x) sum(x$Clones)))
+igh.clns <- as.data.frame(t(igh.clns))
+igh.clns$sample <- rownames(igh.clns)
+igh.clns$group <- ifelse(grepl('control', igh.clns$sample), 'Control', 'FIP')
+igh.clns$tissue <- ifelse(grepl('liver', igh.clns$sample), 'Liver', ifelse(grepl('lung', igh.clns$sample), 'Lung', 'MLN'))
+colnames(igh.clns) <- c('Clones', 'Sample', 'Group', 'Tissue')
+#write to table to add IHC results
+# write.table(igh.clns, file = 'tables/rnaseq_igh_clns.txt', sep = '\t')
+
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+igh.clones.gg <- ggplot(igh.clns, aes(Sample, log10(Clones), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  # geom_hline(yintercept = c(3, 3.30103, 3.69897), color = 'black', lty = 'dashed') +
+  # scale_y_continuous(expand = c(0,0), limits = c(0, 5)) +
+  facet_wrap(vars(Tissue), nrow = 1, scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# number of clonotypes
+igh.exp_vol <- repExplore(igh_mixcr$data, .method = 'volume')
+igh.exp_vol$Group <- igh.clns$Group
+igh.exp_vol$Tissue <- igh.clns$Tissue
+igh.clntypes.gg <- ggplot(igh.exp_vol, aes(Sample, log10(Volume), fill = Group)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  # scale_y_continuous(expand = c(0,0), limits = c(0, 4.5)) +
+  facet_wrap(vars(Tissue), nrow = 1, scales = 'free_x') +
+  labs(x = 'Sample', y = 'Clonotypes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+plot_grid(igh.clones.gg, igh.clntypes.gg,
+          align = 'v', 
+          ncol = 1,
+          axis = 'lr')
+
+# plot clones vs clonotypes
+igh.clns.clntypes <- igh.clns
+igh.clns.clntypes$Volume <- igh.exp_vol$Volume
+# read in IHC data
+rnaseq.ihc <- read.csv('rnaseq_igh_ihc.txt', sep = '\t', header = TRUE)
+igh.clns.clntypes <- merge(igh.clns.clntypes, rnaseq.ihc, by = 'Sample')
+# also add to metadata
+igh_mixcr$meta <- merge(igh_mixcr$meta, rnaseq.ihc, by = 'Sample', all.x = TRUE)
+
+ggplot(igh.clns.clntypes, aes(log10(Clones), log10(Volume), color = IHC)) +
+  geom_point() +
+  geom_text_repel(aes(label = Sample)) +
+  theme_bw()
+
+# CDR3 lengths
+igh.exp_len <- repExplore(igh_mixcr$data, .method = "len", .col = "aa")
+vis(igh.exp_len, .by = c('Group'), .meta = igh_mixcr$meta)
+
+# finally, plot clones and clonotypes by tissue and group
+clns.box <- ggplot(igh.clns.clntypes, aes(Group, log10(Clones), group = Group, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = Group), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  labs(x = '', y = expression(log[10]*' clones'), fill = '', color = '') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+clntyp.box <- ggplot(igh.clns.clntypes, aes(Group, log10(Volume), group = Group, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = Group), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  labs(x = '', y = expression(log[10]*' clonotypes'), fill = '', color = '') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+plot_grid(clns.box, clntyp.box, nrow = 2)
+```
+
+Filter out CDR3s of aberrant length (prior to downsampling). 
+
+```{r immunarch_filtering}
+# filter clonotypes by CDR3 length 
+for(i in seq_along(igh_mixcr$data)) {
+  igh_mixcr$data[[i]]$CDR3.length <- nchar(igh_mixcr$data[[i]]$CDR3.aa)
+}
+
+igh_mixcr.f <- repFilter(igh_mixcr, .method = 'by.clonotype', .query = list(CDR3.length = lessthan(35)))
+
+# visualise new CDR3 aa length distribution
+igh.filt_len <- repExplore(igh_mixcr.f$data, .method = "len", .col = "aa")
+vis(igh.filt_len, .by = 'Group', .meta = igh_mixcr.f$meta)
+
+table(igh_mixcr.f$meta$Group)
+igh.f.exp_vol <- repExplore(igh_mixcr.f$data, .method = "volume")
+vis(igh.f.exp_vol)
+# write.table(igh.f.exp_vol, file = 'tables/igh_clonotypes.txt', sep = '\t')
+```
+
+## Downsample MLN clonotypes
+
+```{r immunarch_mln_downsample}
+min(unlist(lapply(igh_mixcr.f$data[grep("mln", names(igh_mixcr.f$data))], function(x) sum(x$Clones))))
+# IGH - set to 51568 - min sample clones after filtering (control_174_mln)
+mln_mixcr.f <- list()
+mln_mixcr.f$data <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("MLN")))$data
+mln_mixcr.f$meta <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("MLN")))$meta
+mln_mixcr.f2 <- list()
+mln_mixcr.f2$data <- repFilter(mln_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(50000)))$data
+mln_mixcr.f2$meta <- repFilter(mln_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(50000)))$meta
+mln_mixcr.f.ds <- mln_mixcr.f2
+mln_mixcr.f.ds$data <- repSample(mln_mixcr.f2$data, .method = 'downsample', .n = 51568)
+# export for additional analyses
+# saveRDS(mln_mixcr.f.ds, file = 'mln_mixcr_f_ds.rds')
+```
+
+```{r immunarch_mln_stats}
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# get clonality
+mln_rare <- repClonality(mln_mixcr.f.ds$data, .method = 'rare')
+
+# re-plot with new sample order based on Group/FCoV abundance
+mln.sample_order <- c("control_54_mln", "control_69_mln", "control_135_mln", "control_136_mln", "control_174_mln", "control_188_mln", "control_164_mln", "fip_142_mln", "fip_192_mln", "fip_37_mln", "fip_96_mln", "fip_120_mln", "fip_172_mln", "fip_68_mln", "fip_86_mln")
+
+mln_rare <- mln_rare[mln.sample_order,]
+
+# borrowed preprocessing code from immunarch github - https://github.com/immunomind/immunarch/blob/master/R/vis.R
+  tmp <- mln_rare
+  if (is.null(dim(tmp))) {
+    tmp <- t(as.matrix(tmp))
+    mln_rare <- t(as.matrix(mln_rare))
+  }
+
+  colnames_new <- c()
+  prev_value <- "1"
+  start_index <- 1
+  if (colnames(mln_rare)[1] == "1") {
+    colnames_new <- "1"
+    prev_value <- "2"
+    start_index <- 2
+  }
+  for (i in start_index:ncol(mln_rare)) {
+    colnames_new <- c(colnames_new, paste0(prev_value, " - ", colnames(mln_rare)[i]))
+    if (colnames(mln_rare)[i] != "MAX") {
+      prev_value <- as.character(as.integer(colnames(mln_rare)[i]) + 1)
+    }
+  }
+  colnames(tmp) <- colnames_new
+
+  for (i in 2:ncol(mln_rare)) {
+    tmp[, i] <- mln_rare[, i] - mln_rare[, i - 1]
+  }
+  mln.res <- tmp
+
+  mln.res <- as.data.frame(mln.res)
+  mln.res$Sample <- row.names(mln.res)
+  mln.res <- reshape2::melt(mln.res)
+  colnames(mln.res) <- c("Sample", "Counts", "Value")
+  
+  mln.res$Sample <- factor(mln.res$Sample, levels = mln.sample_order)
+
+ggplot(mln.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  scale_y_continuous(expand = c(0,0), labels = seq(0,100,25)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Occupied repertoire space (%)', fill = 'Clonotype counts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# diversity estimates
+# chao
+alpha.chao <- repDiversity(mln_mixcr.f.ds$data, 'chao1')
+
+# nice boxplots
+alpha.chao.df <- as.data.frame(alpha.chao)
+alpha.chao.df$IHC <- mln_mixcr.f.ds$meta$IHC
+
+compare_means(Estimator ~ IHC, data = alpha.chao.df)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.chao.gg <- ggplot(alpha.chao.df, aes(IHC, Estimator, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 40000)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 37000) +
+  labs(x = '', y = 'Chao1 index') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# gini
+mln.div_gini <- repDiversity(mln_mixcr.f.ds$data, 'gini')
+mln.div_gini <- as.data.frame(mln.div_gini)
+mln.div_gini$group <- mln_mixcr.f.ds$meta$Group
+mln.div_gini$IHC <- mln_mixcr.f.ds$meta$IHC
+
+# add rna-seq fcov abundance
+fcov <- read.csv('fcov_per_sample.txt', sep = '\t', header = TRUE)
+fcov$Sample <- rownames(fcov)
+fcov.mln <- fcov[fcov$tissue == 'MLN',]
+mln.div_gini$Sample <- rownames(mln.div_gini)
+mln.div_gini <- merge(mln.div_gini, fcov.mln, by = 'Sample')
+mln.div_gini$fcov <- ifelse(mln.div_gini$value > -6.385045, '+', '-')
+
+# get p values
+compare_means(V1 ~ fcov, data = mln.div_gini)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.gini.gg <- ggplot(mln.div_gini, aes(fcov, V1, group = fcov, fill = fcov)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  geom_jitter(aes(color = group), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_y_continuous(limits = c(0, 1)) +
+  stat_compare_means() +
+  stat_compare_means(label.y = 1) +
+  labs(x = '', y = 'Gini coefficient') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# correlation between gini and fcov
+mln.div_gini2 <- mln.div_gini[mln.div_gini$group == 'FIP',]
+mln.div_gini2$group <- c('FIP', 'FIP (focal renal)', 'FIP', 'FIP (focal renal)', rep('FIP', 4))
+
+ggplot(mln.div_gini2, aes(value, V1)) +
+  geom_smooth(method = 'lm', se = FALSE, color = 'darkgrey', lty = 'dashed') +
+  geom_point(aes(colour = group)) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Gini coefficient', colour = '') +
+  scale_color_manual(values = c('#8F3092', '#D071AD')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Calculate isotype usage for MLN samples.
+
+```{r isotype_mln}
+# for list of dfs, get IGHC name and frequency
+isotype.mln <- lapply(mln_mixcr.f.ds$data, `[`, c('C.name', 'Proportion'))
+
+library(tidyverse)
+# remove alignment scores and secondary alignments, and collapse IGHG subtype
+isotype.mln <- isotype.mln %>% 
+  map(~ .x %>% mutate(C.name = gsub('\\(.{2,7}\\)', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub(', .*', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub('IGHG1|IGHG2|IGHG3', 'IGHG', C.name)))
+
+# normalise as proportion of unique clonotypes
+isotype.mln.summ <- lapply(isotype, function(x) {
+  x %>%
+  group_by(C.name) %>%
+  summarise(Count = n()) %>%
+  mutate(Proportion = Count/nrow(x)) %>%
+  complete(C.name = c('IGHM', 'IGHA', 'IGHD', 'IGHE', 'IGHG'), fill = list(Proportion = 0))
+})
+
+# add sample name and combine
+isotype.mln.all <- bind_rows(isotype.mln.summ, .id = 'Sample')
+
+# replace NAs with 'Other'
+isotype.mln.all$C.name[is.na(isotype.mln.all$C.name)] <- 'Other'
+
+# set sample order
+isotype.mln.all$Sample <- factor(isotype.mln.all$Sample, levels = mln.sample_order)
+
+# plot
+library(ggplot2)
+library(ggsci)
+
+ggplot(isotype.mln.all, aes(Sample, Proportion, fill = C.name, group = Sample)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  scale_fill_d3() +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = '', y = 'Proportion of clonotypes', fill = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# plot frequencies by group
+isotype.mln.all$Group <- ifelse(grepl('control', isotype.mln.all$Sample), 'Control', 'FIP')
+
+ggplot(isotype.mln.all, aes(Group, Proportion, group = Group, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(colour = Group), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  facet_wrap(vars(C.name), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+compare_means(Proportion ~ Group, data = isotype.mln.all, group.by = 'C.name', method = 'wilcox.test', p.adjust.method = 'bonferroni')
+```
+
+## Downsample Liver clonotypes
+
+```{r immunarch_liver_downsample}
+min(unlist(lapply(igh_mixcr.f$data[grep("liver", names(igh_mixcr.f$data))], function(x) sum(x$Clones))))
+# IGH - set to 4568 - drops control_174_liver and fip_120_liver
+liver_mixcr.f <- list()
+liver_mixcr.f$data <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("Liver")))$data
+liver_mixcr.f$meta <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("Liver")))$meta
+liver_mixcr.f2 <- list()
+liver_mixcr.f2$data <- repFilter(liver_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(4560)))$data
+liver_mixcr.f2$meta <- repFilter(liver_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(4560)))$meta
+liver_mixcr.f.ds <- liver_mixcr.f2
+liver_mixcr.f.ds$data <- repSample(liver_mixcr.f2$data, .method = 'downsample', .n = 4568)
+# export for additional analyses
+# saveRDS(liver_mixcr.f.ds, file = 'liver_mixcr_f_ds.rds')
+```
+
+```{r immunarch_liver_stats}
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# get clonality
+liver_rare <- repClonality(liver_mixcr.f.ds$data, .method = 'rare')
+
+# re-plot with new sample order based on Group/FCoV abundance
+liver.sample_order <- c("control_54_liver", "control_69_liver", "control_135_liver", "control_136_liver", "control_188_liver", "control_164_liver", "fip_142_liver", "fip_192_liver", "fip_96_liver", "fip_172_liver", "fip_37_liver", "fip_68_liver", "fip_86_liver")
+
+liver_rare <- liver_rare[liver.sample_order,]
+
+# borrowed preprocessing code from immunarch github - https://github.com/immunomind/immunarch/blob/master/R/vis.R
+  tmp <- liver_rare
+  if (is.null(dim(tmp))) {
+    tmp <- t(as.matrix(tmp))
+    liver_rare <- t(as.matrix(liver_rare))
+  }
+
+  colnames_new <- c()
+  prev_value <- "1"
+  start_index <- 1
+  if (colnames(liver_rare)[1] == "1") {
+    colnames_new <- "1"
+    prev_value <- "2"
+    start_index <- 2
+  }
+  for (i in start_index:ncol(liver_rare)) {
+    colnames_new <- c(colnames_new, paste0(prev_value, " - ", colnames(liver_rare)[i]))
+    if (colnames(liver_rare)[i] != "MAX") {
+      prev_value <- as.character(as.integer(colnames(liver_rare)[i]) + 1)
+    }
+  }
+  colnames(tmp) <- colnames_new
+
+  for (i in 2:ncol(liver_rare)) {
+    tmp[, i] <- liver_rare[, i] - liver_rare[, i - 1]
+  }
+  liver.res <- tmp
+
+  liver.res <- as.data.frame(liver.res)
+  liver.res$Sample <- row.names(liver.res)
+  liver.res <- reshape2::melt(liver.res)
+  colnames(liver.res) <- c("Sample", "Counts", "Value")
+  
+  liver.res$Sample <- factor(liver.res$Sample, levels = liver.sample_order)
+
+ggplot(liver.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  # scale_y_continuous(expand = c(0,0), labels = seq(0,100,25)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Occupied repertoire space (%)', fill = 'Clonotype counts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# diversity estimates
+# chao
+alpha.chao <- repDiversity(liver_mixcr.f.ds$data, 'chao1')
+
+# nice boxplots
+alpha.chao.df <- as.data.frame(alpha.chao)
+alpha.chao.df$IHC <- liver_mixcr.f.ds$meta$IHC
+
+compare_means(Estimator ~ IHC, data = alpha.chao.df)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.chao.gg <- ggplot(alpha.chao.df, aes(IHC, Estimator, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 40000)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 37000) +
+  labs(x = '', y = 'Chao1 index') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# gini
+liver.div_gini <- repDiversity(liver_mixcr.f.ds$data, 'gini')
+liver.div_gini <- as.data.frame(liver.div_gini)
+liver.div_gini$group <- liver_mixcr.f.ds$meta$Group
+liver.div_gini$IHC <- liver_mixcr.f.ds$meta$IHC
+
+# get p values
+compare_means(V1 ~ IHC, data = liver.div_gini)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+# add rna-seq fcov abundance
+fcov.liver <- fcov[fcov$tissue == 'Liver',]
+liver.div_gini$Sample <- rownames(liver.div_gini)
+liver.div_gini <- merge(liver.div_gini, fcov.mln, by = 'Sample')
+liver.div_gini$fcov <- ifelse(liver.div_gini$value > -6.385045, '+', '-')
+
+alpha.gini.gg <- ggplot(liver.div_gini, aes(IHC, V1, group = IHC, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 1)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 1) +
+  labs(x = '', y = 'Gini coefficient') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# orrelation between gini and fcov
+liver.div_gini2 <- liver.div_gini[liver.div_gini$group == 'FIP',]
+liver.div_gini2$group <- c('FIP (focal renal)', 'FIP', 'FIP (focal renal)', rep('FIP', 4))
+
+ggplot(liver.div_gini2, aes(value, V1)) +
+  geom_smooth(method = 'lm', se = FALSE, color = 'darkgrey', lty = 'dashed') +
+  geom_point(aes(colour = group)) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Gini coefficient', colour = '') +
+  scale_color_manual(values = c('#8F3092', '#D071AD')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Calculate isotype usage for Liver samples.
+
+```{r isotype_liver}
+# for list of dfs, get IGHC name and frequency
+isotype.liver <- lapply(liver_mixcr.f.ds$data, `[`, c('C.name', 'Proportion'))
+
+library(tidyverse)
+# remove alignment scores and secondary alignments, and collapse IGHG subtype
+isotype.liver <- isotype.liver %>% 
+  map(~ .x %>% mutate(C.name = gsub('\\(.{2,7}\\)', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub(', .*', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub('IGHG1|IGHG2|IGHG3', 'IGHG', C.name)))
+
+# count of clonotypes by isotype
+isotype.liver.summ <- lapply(isotype.liver, function(x) {
+  x %>%
+  group_by(C.name) %>%
+  summarise(Count = n()) %>%
+  mutate(Proportion = Count/nrow(x)) %>%
+  complete(C.name = c('IGHM', 'IGHA', 'IGHD', 'IGHE', 'IGHG'), fill = list(Proportion = 0))
+})
+
+# add sample name and combine
+isotype.liver.all <- bind_rows(isotype.liver.summ, .id = 'Sample')
+
+# replace NAs with 'Other'
+isotype.liver.all$C.name[is.na(isotype.liver.all$C.name)] <- 'Other'
+
+# set sample order
+isotype.liver.all$Sample <- factor(isotype.liver.all$Sample, levels = liver.sample_order)
+
+# plot
+library(ggplot2)
+library(ggsci)
+
+ggplot(isotype.liver.all, aes(Sample, Proportion, fill = C.name, group = Sample)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  scale_fill_d3() +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = '', y = 'Fraction of clonotypes', fill = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# plot frequencies by group
+isotype.liver.all$Group <- ifelse(grepl('control', isotype.liver.all$Sample), 'Control', 'FIP')
+
+ggplot(isotype.liver.all, aes(Group, Proportion, group = Group, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(colour = Group), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  facet_wrap(vars(C.name), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+compare_means(Proportion ~ Group, data = isotype.liver.all, group.by = 'C.name', method = 'wilcox.test', p.adjust.method = 'bonferroni')
+```
+
+## Downsample Lung clonotypes
+
+```{r immunarch_lung_downsample}
+min(unlist(lapply(igh_mixcr.f$data[grep("lung", names(igh_mixcr.f$data))], function(x) sum(x$Clones))))
+# IGH - set to 11576 
+lung_mixcr.f <- list()
+lung_mixcr.f$data <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("Lung")))$data
+lung_mixcr.f$meta <- repFilter(igh_mixcr.f, .method = "by.meta", .query = list(Tissue = include("Lung")))$meta
+lung_mixcr.f2 <- list()
+lung_mixcr.f2$data <- repFilter(lung_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(11500)))$data
+lung_mixcr.f2$meta <- repFilter(lung_mixcr.f, .method = "by.repertoire", .query = list(n_clones = morethan(11500)))$meta
+lung_mixcr.f.ds <- lung_mixcr.f2
+lung_mixcr.f.ds$data <- repSample(lung_mixcr.f2$data, .method = 'downsample', .n = 11576)
+# export for additional analyses
+# saveRDS(lung_mixcr.f.ds, file = 'lung_mixcr_f_ds.rds')
+```
+
+```{r immunarch_lung_stats}
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# get clonality
+lung_rare <- repClonality(lung_mixcr.f.ds$data, .method = 'rare')
+
+# re-plot with new sample order based on group/FCoV abundance
+lung.sample_order <- c("control_54_lung", "control_69_lung", "control_135_lung", "control_136_lung", "control_174_lung", "control_188_lung", "control_164_lung", "fip_142_lung", "fip_192_lung", "fip_68_lung", "fip_86_lung", "fip_172_lung")
+
+lung_rare <- lung_rare[lung.sample_order,]
+
+# borrowed preprocessing code from immunarch github - https://github.com/immunomind/immunarch/blob/master/R/vis.R
+  tmp <- lung_rare
+  if (is.null(dim(tmp))) {
+    tmp <- t(as.matrix(tmp))
+    lung_rare <- t(as.matrix(lung_rare))
+  }
+
+  colnames_new <- c()
+  prev_value <- "1"
+  start_index <- 1
+  if (colnames(lung_rare)[1] == "1") {
+    colnames_new <- "1"
+    prev_value <- "2"
+    start_index <- 2
+  }
+  for (i in start_index:ncol(lung_rare)) {
+    colnames_new <- c(colnames_new, paste0(prev_value, " - ", colnames(lung_rare)[i]))
+    if (colnames(lung_rare)[i] != "MAX") {
+      prev_value <- as.character(as.integer(colnames(lung_rare)[i]) + 1)
+    }
+  }
+  colnames(tmp) <- colnames_new
+
+  for (i in 2:ncol(lung_rare)) {
+    tmp[, i] <- lung_rare[, i] - lung_rare[, i - 1]
+  }
+  lung.res <- tmp
+
+  lung.res <- as.data.frame(lung.res)
+  lung.res$Sample <- row.names(lung.res)
+  lung.res <- reshape2::melt(lung.res)
+  colnames(lung.res) <- c("Sample", "Counts", "Value")
+  
+  lung.res$Sample <- factor(lung.res$Sample, levels = lung.sample_order)
+
+ggplot(lung.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  # scale_y_continuous(expand = c(0,0), labels = seq(0,100,25)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Occupied repertoire space (%)', fill = 'Clonotype counts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# diversity estimates
+# chao
+alpha.chao <- repDiversity(lung_mixcr.f.ds$data, 'chao1')
+
+# nice boxplots
+alpha.chao.df <- as.data.frame(alpha.chao)
+alpha.chao.df$IHC <- lung_mixcr.f.ds$meta$IHC
+
+compare_means(Estimator ~ IHC, data = alpha.chao.df)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.chao.gg <- ggplot(alpha.chao.df, aes(IHC, Estimator, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 40000)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 37000) +
+  labs(x = '', y = 'Chao1 index') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# gini
+lung.div_gini <- repDiversity(lung_mixcr.f.ds$data, 'gini')
+lung.div_gini <- as.data.frame(lung.div_gini)
+lung.div_gini$group <- lung_mixcr.f.ds$meta$Group
+lung.div_gini$IHC <- lung_mixcr.f.ds$meta$IHC
+
+# add rna-seq fcov abundance
+fcov.lung <- fcov[fcov$tissue == 'Lung',]
+lung.div_gini$Sample <- rownames(lung.div_gini)
+lung.div_gini <- merge(lung.div_gini, fcov.lung, by = 'Sample')
+lung.div_gini$fcov <- ifelse(lung.div_gini$value > -6.385045, '+', '-')
+
+# get p values
+# compare_means(V1 ~ IHC, data = lung.div_gini)
+my.comparisons <- list(c('Control', 'FCoV -'), c('FCoV -', 'FCoV +'), c('Control', 'FCoV +'))
+
+alpha.gini.gg <- ggplot(lung.div_gini, aes(IHC, V1, group = IHC, fill = IHC)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  geom_jitter(aes(color = IHC), width = 0.1, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_color_manual(values = c('#32A7CD', '#D071AD', '#8F3092', 'darkgray')) +
+  scale_y_continuous(limits = c(0, 1)) +
+  stat_compare_means(comparisons = my.comparisons) +
+  stat_compare_means(label.y = 1) +
+  labs(x = '', y = 'Gini coefficient') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# correlation between gini and fcov
+lung.div_gini2 <- lung.div_gini[lung.div_gini$group == 'FIP',]
+lung.div_gini2$group <- c('FIP (focal renal)', 'FIP', 'FIP (focal renal)', rep('FIP', 2))
+
+ggplot(lung.div_gini2, aes(value, V1)) +
+  geom_smooth(method = 'lm', se = FALSE, color = 'darkgrey', lty = 'dashed') +
+  geom_point(aes(colour = group)) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Gini coefficient', colour = '') +
+  scale_color_manual(values = c('#8F3092', '#D071AD')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Calculate isotype usage for Lung samples.
+
+```{r isotype_lung}
+# for list of dfs, get IGHC name and frequency
+isotype.lung <- lapply(lung_mixcr.f.ds$data, `[`, c('C.name', 'Proportion'))
+
+library(tidyverse)
+# remove alignment scores and secondary alignments, and collapse IGHG subtype
+isotype.lung <- isotype.lung %>% 
+  map(~ .x %>% mutate(C.name = gsub('\\(.{2,7}\\)', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub(', .*', '', C.name))) %>%
+  map(~ .x %>% mutate(C.name = gsub('IGHG1|IGHG2|IGHG3', 'IGHG', C.name)))
+
+# count of clonotypes by isotype
+isotype.lung.summ <- lapply(isotype.lung, function(x) {
+  x %>%
+  group_by(C.name) %>%
+  summarise(Count = n()) %>%
+  mutate(Proportion = Count/nrow(x)) %>%
+  complete(C.name = c('IGHM', 'IGHA', 'IGHD', 'IGHE', 'IGHG'), fill = list(Proportion = 0))
+})
+
+# add sample name and combine
+isotype.lung.all <- bind_rows(isotype.lung.summ, .id = 'Sample')
+
+# replace NAs with 'Other'
+isotype.lung.all$C.name[is.na(isotype.lung.all$C.name)] <- 'Other'
+
+# set sample order
+isotype.lung.all$Sample <- factor(isotype.lung.all$Sample, levels = lung.sample_order)
+
+# plot
+library(ggplot2)
+library(ggsci)
+
+ggplot(isotype.lung.all, aes(Sample, Proportion, fill = C.name, group = Sample)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  scale_fill_d3() +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = '', y = 'Fraction of clonotypes', fill = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# plot frequencies by group
+isotype.lung.all$Group <- ifelse(grepl('control', isotype.lung.all$Sample), 'Control', 'FIP')
+
+ggplot(isotype.lung.all, aes(Group, Proportion, group = Group, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(colour = Group), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  facet_wrap(vars(C.name), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+compare_means(Proportion ~ Group, data = isotype.lung.all, group.by = 'C.name', method = 'wilcox.test', p.adjust.method = 'bonferroni')
+```
+
+## All tissues
+
+Get stacked bar plots showing proportion of repertoire occupied by clonotypes with specific counts, faceted by tissue. 
+
+```{r alltissues_clntypcounts}
+# rbind dataframes
+all.res <- rbind(liver.res, lung.res, mln.res)
+
+# add tissue
+all.res$tissue <- ifelse(grepl('liver', all.res$Sample), 'Liver', 
+                         ifelse(grepl('lung', all.res$Sample), 'Lung', 
+                                'MLN'))
+
+# plot
+ggplot(all.res, aes(Sample, Value, group = Counts, fill = Counts)) +
+  geom_bar(stat = 'identity', position = 'stack', color = 'black', width = 1) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0), breaks = seq(0,1,0.2)) +
+  scale_fill_manual(values = c('#FF4B20','#FF9F30','#DCDFA2','#A8E6F3','#63ABEC','#0348A6')) +
+  labs(x = '', y = 'Proportion of clonotypes', fill = 'Clonotype counts') +
+  facet_grid(cols = vars(tissue), scales = 'free_x', space = 'free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(panel.grid = element_blank())
+```
+
+Plot correlation of Gini coefficient and FCoV abundance in all tissues. 
+
+```{r alltissues_ginifcovcorr}
+# rbind datasets
+all.div_gini <- rbind(liver.div_gini2, lung.div_gini2, mln.div_gini2)
+
+# plot
+ggplot(all.div_gini, aes(value, V1)) +
+  geom_smooth(method = 'lm', se = FALSE, color = 'darkgrey', lty = 'dashed', fullrange = TRUE) +
+  geom_point(aes(colour = group)) +
+  labs(x = expression('FCoV '*log[2]*' CPM'), y = 'Gini coefficient', colour = '') +
+  scale_color_manual(values = c('#8F3092', '#D071AD')) +
+  facet_wrap(vars(tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Get gene usage stats and plot heatmap/correlation for all samples (normalised as proportion of clonotypes).
+
+First fix the functions distributed with immunarch.
+
+```{r immunarch_gene_usage_altfunctions}
+geneUsage2 <- function(.data, # df, list, MonetDB
+                      .gene = c("hs.trbv", "HomoSapiens.TRBJ", "macmul.IGHV"),
+                      .quant = c(NA, "count"),
+                      .ambig = c("inc", "exc", "maj"),
+                      .type = c("segment", "allele", "family"),
+                      .norm = FALSE) {
+  .type <- .type[1]
+  .ambig <- .ambig[1]
+  .quant <- .quant[1]
+  .gene <- .gene[1]
+  
+  if (immunarch:::has_class(.data, "list")) {
+    if (length(.data) == 1) {
+      return(geneUsage2(.data[[1]], .gene = .gene, .quant = .quant, .ambig = .ambig, .norm = .norm))
+    } else {
+      genedata <- lapply(.data, geneUsage2,
+                         .gene = .gene, .quant = .quant,
+                         .ambig = .ambig, .type = .type, .norm = .norm
+      )
+      
+      # Add check if list has 1 element
+      for (i in 2:(length(genedata))) {
+        if (i > 2) {
+          allres <- full_join(allres, genedata[[i]], by = "Names")
+          names(allres)[i + 1] <- names(genedata)[i]
+        } else {
+          allres <- full_join(genedata[[1]], genedata[[2]], by = "Names")
+          names(allres)[2] <- names(genedata)[1]
+          names(allres)[3] <- names(genedata)[2]
+        }
+      }
+      allres <- allres[order(allres$Names), ]
+      
+      return(immunarch:::add_class(allres, "immunr_gene_usage"))
+    }
+  }
+  
+  "%!in%" <- function(x, y) !("%in%"(x, y))
+  
+  which_gene <- strsplit(.gene, ".", TRUE)[[1]][2]
+  gene_col <- tolower(substr(which_gene, 4, 4))
+  if (gene_col == "v") {
+    gene_col <- immunarch:::IMMCOL$v
+  } else if (gene_col == "d") {
+    gene_col <- immunarch:::IMMCOL$d
+  } else if (gene_col == "j") {
+    gene_col <- immunarch:::IMMCOL$j
+  } else {
+    stop("The entered gene_col name is invalid")
+  }
+  
+  .gene <- get_genes2(.gene, .type)
+  
+  # Bad Cases:
+  # X.name is segments, .type == "alleles"
+  # X.name is families, .type == "segments"
+  # X.name is families, .type == "alleles"
+  
+  if (.ambig == "inc") {
+    if (.type == "segment") {
+      .data[[gene_col]] <- immunarch:::return_segments(.data[[gene_col]])
+    } else if (.type == "family") {
+      .data[[gene_col]] <- immunarch:::return_families(.data[[gene_col]])
+    }
+  }
+  
+  if (immunarch:::has_class(.data, "data.table")) {
+    .data <- .data %>% lazy_dt()
+  }
+  dataset <- .data %>%
+    select(Gene = gene_col, immunarch:::IMMCOL$count) %>%
+    group_by(Gene) %>%
+    rename(Quant = immunarch:::IMMCOL$count)
+  
+  if (is.na(.quant)) {
+    dataset <- dataset %>%
+      summarise(count = n())
+  } else {
+    dataset <- dataset %>%
+      summarise(count = sum(Quant))
+  }
+  
+  dataset <- dataset %>%
+    collect(n = Inf)
+  
+  if (.ambig == "inc") {
+    res <- dataset
+    names(res) <- c("Names", immunarch:::IMMCOL$count)
+  } else {
+    gene_col_split <- strsplit(dataset[["Gene"]], ", ", fixed = TRUE, useBytes = TRUE)
+    counts <- dataset$count
+    names(counts) <- dataset[["Gene"]]
+    
+    if (.ambig == "exc") {
+      included_names <- names(counts) %in% gene_col_split[sapply(gene_col_split, length) == 1]
+      chosen <- counts[included_names]
+      chosen <- chosen[names(chosen) %in% .gene]
+      other <- counts[names(chosen) %!in% .gene]
+      res <- data.frame(
+        Names = names(chosen),
+        Count = unlist(chosen), stringsAsFactors = FALSE
+      )
+    } else if (.ambig == "maj") {
+      maj_counts <- data.frame(Names = sapply(gene_col_split, "[[", 1), Counts = counts, stringsAsFactors = FALSE)
+      row.names(maj_counts) <- NULL
+      res <- maj_counts %>%
+        group_by(Names) %>%
+        summarise(Counts = sum(Counts))
+    }
+  }
+  if (length(.gene %in% res[[1]]) < length(.gene)) {
+    missing <- data.frame(.gene[!.gene %in% res[[1]]],
+                          0,
+                          stringsAsFactors = FALSE
+    )
+    names(missing) <- names(res)
+    res <- rbind(res, missing)
+  }
+  row.names(res) <- NULL
+  res <- res[order(res[[1]]), ]
+  if (.norm) {
+    res[, 2] <- res[, 2] / sum(res[, 2])
+  }
+  res <- as_tibble(as.data.frame(res))
+  immunarch:::add_class(res, "immunr_gene_usage")
+}
+
+
+
+get_genes2 <- function(.gene = c("hs.trbv", "HomoSapiens.trbj", "macmul.ighv"), .type = c("segment", "allele", "family")) {
+  .gene <- .gene[1]
+  .type <- .type[1]
+  
+  # Species
+  .gene <- tolower(.gene)
+  which_species <- strsplit(.gene, ".", TRUE)[[1]][1]
+  if (which_species %in% GENE_SEGMENTS2$alias) {
+    which_species_col <- "alias"
+  } else {
+    if (which_species %in% tolower(GENE_SEGMENTS2$species)) {
+      which_species_col <- "species"
+    } else {
+      stop("Unknown species name / alias")
+    }
+  }
+  
+  # Genes
+  which_gene <- strsplit(.gene, ".", TRUE)[[1]][2]
+  if (!(which_gene %in% GENE_SEGMENTS2[["gene"]][tolower(GENE_SEGMENTS2[[which_species_col]]) == which_species])) {
+    stop("Unknown gene name")
+  }
+  
+  # Id's type
+  which_type <- paste0(.type, "_id")
+  
+  sort(unique(GENE_SEGMENTS2[[which_type]][tolower(GENE_SEGMENTS2[[which_species_col]]) == which_species & GENE_SEGMENTS2[["gene"]] == which_gene]))
+}
+```
+
+```{r alltissues_geneusage}
+igh_mixcr.f.gu <- igh_mixcr.f
+
+# tidyverse solution - https://stackoverflow.com/questions/67837922/apply-gsub-over-a-certain-column-in-a-list-of-data-frames
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+
+igh_mixcr.f.gu$data <- igh_mixcr.f.gu$data %>% 
+  map(~ .x %>% mutate(V.name = gsub('\\(.{2,7}\\)', '', V.name),
+                      D.name = gsub('\\(.{2,7}\\)', '', D.name),
+                      J.name = gsub('\\(.{2,7}\\)', '', J.name)))
+
+# constructed GENE_SEGMENTS entries for feline VDJ genes - formatted as follows
+# alias	species	gene	family_id	segment_id	allele_id
+# fc	FelisCatus	ighv	IGHV4	IGHV4-1	IGHV4-1*01
+# fc	FelisCatus	ighv	IGHV3	IGHV3-2	IGHV3-2*01
+# fc	FelisCatus	ighv	IGHV3	IGHV3-3	IGHV3-3*01
+# fc	FelisCatus	ighv	IGHV3	IGHV3-4	IGHV3-4*01
+
+# read in and rbind
+feline.gene_segments <- read.csv(file = 'gene_segments_cat.txt', sep = '\t', header = T)
+GENE_SEGMENTS2 <- rbind(GENE_SEGMENTS, feline.gene_segments)
+
+# calculate and plot gene usage
+# IGHV
+igh_ighv_gu <- geneUsage2(igh_mixcr.f.gu$data, "fc.ighv", .quant = NA, .ambig = 'maj', .norm = T)
+vis(igh_ighv_gu, .by = c("Group"), .plot = 'box', .meta = igh_mixcr.f.gu$meta)
+
+igh_ighv_gu2 <- as.data.frame(igh_ighv_gu)
+rownames(igh_ighv_gu2) <- igh_ighv_gu2$Names
+igh_ighv_gu2$Names <- NULL
+# replace NAs with 0
+igh_ighv_gu2[is.na(igh_ighv_gu2)] <- 0
+
+igh_ighv.breaks = seq(-3,3,0.001)
+igh_ighv.cols = colorRampPalette(brewer.pal(9, 'RdYlBu'))(length(igh_ighv.breaks))
+pheatmap(igh_ighv_gu2, 
+         breaks = igh_ighv.breaks,
+         color = igh_ighv.cols,
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE,
+         angle_col = 45,
+         scale = 'row')
+
+igh_ighv_gu_cor <- geneUsageAnalysis(igh_ighv_gu, .method = "cor", .verbose = F)
+vis(igh_ighv_gu_cor, .title = "Gene usage correlation", .leg.title = "Cor", .text.size = 0)
+
+# plot PCA of IGHV usage in all tissues
+pca.n <- prcomp(t(igh_ighv_gu2), scale. = TRUE, center = TRUE)
+
+scores.n  = as.data.frame(pca.n$x)
+attach(scores.n)
+
+var.capn = summary(pca.n)
+pc_var.capn = round(var.capn$importance[2,]*100, 1)
+cum_var.capn = round(var.capn$importance[3,]*100, 1)
+
+library(ggplot2)
+library(ggdendro)
+library(reshape2)
+
+pca_plot <- scores.n[,1:2]
+pca_plot$sample <- rownames(pca_plot)
+pca_plot$group <- ifelse(grepl('control', pca_plot$sample), 'Control', 'FIP')
+pca_plot$group <- ifelse(grepl('142|192', pca_plot$sample), 'FIP (focal renal)', pca_plot$group)
+pca_plot$tissue <- ifelse(grepl('liver', pca_plot$sample), 'Liver', 
+                         ifelse(grepl('lung', pca_plot$sample), 'Lung', 
+                                'MLN'))
+pca_plot$cat <- paste(str_split_i(pca_plot$sample, '_', 1), str_split_i(pca_plot$sample, '_', 2), sep = '_')
+
+library(ggrepel)
+
+ggplot(pca_plot, aes(PC1, PC2, fill = group, shape = tissue)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(x = PC1, y = PC2, label = sample), max.overlaps = 20, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_shape_manual(values = c(21, 23, 25)) +
+  geom_hline(linetype = 3, yintercept = 0) +
+  geom_vline(linetype = 3, xintercept = 0) +
+  labs(x = paste('PC1: ', pc_var.capn[1], sep = '', '% of variance'), y = paste('PC2: ', pc_var.capn[2], sep = '', '% of variance'), fill = 'Group', shape = 'Tissue') +
+  guides(fill = guide_legend(override.aes = list(shape = 21))) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# significance testing
+# test for difference between groups
+# within group variance is radically different due to control_69
+library(vegan)
+
+dist <- vegdist(t(igh_ighv_gu2), method = 'bray')
+plot(betadisper(dist, c(rep('Control', 21), rep('FIP', 21))))
+boxplot(betadisper(dist, c(rep('Control', 21), rep('FIP', 21))))
+anova(betadisper(dist, c(rep('Control', 21), rep('FIP', 21))))
+
+# permanova
+igh_ighv_gu4 <- as.data.frame(scale(as.data.frame(t(igh_ighv_gu2)), center = TRUE))
+igh_ighv_gu4$group <- c(rep('Control', 21), rep('FIP', 21))
+igh_ighv_gu5 <- as.data.frame(t(igh_ighv_gu2))
+igh_ighv_gu5$group <- c(rep('Control', 21), rep('FIP', 21))
+
+res <- adonis2(igh_ighv_gu5[,1:64] ~ group, data = igh_ighv_gu5, method = 'bray')
+
+# boxplots for specific genes - 3-30, 3-60, 3-15, 3-5, 3-3
+ighv.plot <- igh_ighv_gu2[rownames(igh_ighv_gu2) %in% c('IGHV3-30'),]
+
+ighv.melt <- reshape2::melt(t(ighv.plot))
+ighv.melt$Group1 <- ifelse(grepl('control', ighv.melt$Var1), 'Control', 'FIP')
+ighv.melt$Group2 <- ifelse(grepl('142|192', ighv.melt$Var1), 'FIP (focal renal)', ighv.melt$Group1)
+ighv.melt$tissue <- ifelse(grepl('liver', ighv.melt$Var1), 'Liver', 
+                         ifelse(grepl('lung', ighv.melt$Var1), 'Lung', 'MLN'))
+# ighv.melt$value <- sqrt(ighv.melt$value)
+
+ggplot(ighv.melt, aes(Group1, value)) +
+  geom_boxplot(aes(fill = Group1), outlier.shape = NA, alpha = 0.5, show.legend = FALSE) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  geom_jitter(aes(colour = Group2), width = 0.1) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  labs(x = '', y = 'Proportion of clonotypes', fill = '', colour = '') +
+  facet_wrap(vars(tissue), nrow = 1) +
+  stat_compare_means() +
+  ggtitle('IGHV3-30') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+Plot isotype usage for all samples.
+
+```{r alltissues_isotype}
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
+
+# combine isotype usage data from all samples
+isotype.multitissue <- list(isotype.mln.all, isotype.liver.all, isotype.lung.all)
+names(isotype.multitissue) <- c('MLN', 'Liver', 'Lung')
+
+# bind rows
+isotype.multitissue.df <- bind_rows(isotype.multitissue, .id = 'Tissue')
+
+# add group
+isotype.multitissue.df$Group <- ifelse(grepl('control', isotype.multitissue.df$Sample), 'Control', 'FIP')
+
+# plot props faceted by tissue and isotype
+ggplot(isotype.multitissue.df, aes(Group, Proportion, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  geom_jitter(aes(color = Group), width = 0.1, show.legend = FALSE) +
+  labs(x = '', y = 'Proportion of clonotypes') +
+  facet_grid(rows = vars(C.name), cols = vars(Tissue), scales = 'free_y') +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# individual plots and wilcoxon rank sum tests
+# IGHG
+ighg.multitissue <- lapply(isotype.multitissue, function(x) x[x$C.name == 'IGHG',])
+
+# add group
+ighg.multitissue <- lapply(ighg.multitissue, function(x) {
+  x$Group = ifelse(grepl('control', x$Sample), 'Control', 'FIP')
+  x
+})
+
+# bind rows and plot
+ighg.flat <- bind_rows(ighg.multitissue, .id = 'Tissue')
+ighg.flat$Group2 <- ifelse(grepl('142|192', ighg.flat$Sample), 'FIP (focal renal)', ighg.flat$Group)
+
+ggplot(ighg.flat, aes(Group, Proportion, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, show.legend = FALSE, alpha = 0.5) +
+  stat_compare_means(label.y = 0.9, size = 3) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,1), breaks = seq(0,1,0.2)) +
+  geom_jitter(aes(color = Group2), width = 0.1, show.legend = TRUE) +
+  labs(x = '', y = 'Proportion of clonotypes', title = 'IGHG') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+  
+# get p values
+lapply(ighg.multitissue, function(x) pairwise.wilcox.test(x$Proportion, x$Group, paired = FALSE, p.adjust.method = 'none'))
+
+# IGHM
+ighm.multitissue <- lapply(isotype.multitissue, function(x) x[x$C.name == 'IGHM',])
+
+# add group
+ighm.multitissue <- lapply(ighm.multitissue, function(x) {
+  x$Group = ifelse(grepl('control', x$Sample), 'Control', 'FIP')
+  x
+})
+
+# bind rows and plot
+ighm.flat <- bind_rows(ighm.multitissue, .id = 'Tissue')
+
+ggplot(ighm.flat, aes(Group, Proportion, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  stat_compare_means(label.y = 1.1, size = 3, method = 't.test') +
+  scale_y_continuous(limits = c(0,1.2), breaks = seq(0,1,0.2)) +
+  geom_jitter(aes(color = Group), width = 0.1, show.legend = FALSE) +
+  labs(x = '', y = 'Fraction of clonotypes') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# get p values
+lapply(ighm.multitissue, function(x) pairwise.wilcox.test(x$Proportion, x$Group, paired = FALSE, p.adjust.method = 'none'))
+
+# IGHA
+igha.multitissue <- lapply(isotype.multitissue, function(x) x[x$C.name == 'IGHA',])
+
+# add group
+igha.multitissue <- lapply(igha.multitissue, function(x) {
+  x$Group = ifelse(grepl('control', x$Sample), 'Control', 'FIP')
+  x
+})
+
+# bind rows and plot
+igha.flat <- bind_rows(igha.multitissue, .id = 'Tissue')
+
+ggplot(igha.flat, aes(Group, Proportion, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, show.legend = TRUE, alpha = 0.5) +
+  stat_compare_means(label.y = 1.1, size = 3, method = 't.test') +
+  scale_y_continuous(limits = c(0,1.2), breaks = seq(0,1,0.2)) +
+  geom_jitter(aes(color = Group), width = 0.1, show.legend = FALSE) +
+  labs(x = '', y = 'Fraction of clonotypes') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# get p values
+lapply(igha.multitissue, function(x) pairwise.wilcox.test(x$Proportion, x$Group, paired = FALSE, p.adjust.method = 'none'))
+
+# create faceted plot (stacked bars) for all tissues
+ggplot(isotype.multitissue.df, aes(Sample, Proportion, fill = C.name)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  facet_grid(cols = vars(Tissue), scales = 'free_x', space = 'free') +
+  scale_fill_d3() +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = '', y = 'Fraction of clonotypes', fill = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+# reformat plot as mean
+isotype.multissue.list <- split(isotype.multitissue.df, isotype.multitissue.df$Tissue)
+isotype.multissue.list <- isotype.multissue.list[-1]
+
+isotype.multissue.list <- lapply(isotype.multissue.list, function(x) {
+  x %>%
+    group_by(Group, C.name) %>%
+    summarise(avg.prop = mean(Proportion), sd.prop = plotrix::std.error(Proportion)) %>%
+    arrange(rev(C.name), by.group = TRUE)
+})
+
+isotype.multissue.df2 <- bind_rows(isotype.multissue.list, .id = 'Tissue')
+
+ggplot(isotype.multissue.df2, aes(Group, avg.prop, fill = C.name)) +
+  geom_bar(stat = 'identity', position = 'stack') +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_d3() +
+  labs(x = '', y = 'Proportion of clonotypes', fill = '') +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Network analysis (NAIR)
+
+https://mlizhangx.github.io/Network-Analysis-for-Repertoire-Sequencing-/
+
+```{r alltissues_nair_clonesampling}
+# create a list of tissue repertoires for each cat
+all.f.list <- list(control_135 = list(control_135_liver = igh_mixcr.f$data$control_135_liver, 
+                                      control_135_lung = igh_mixcr.f$data$control_135_lung, 
+                                      control_135_mln = igh_mixcr.f$data$control_135_mln),
+                   control_136 = list(control_136_liver = igh_mixcr.f$data$control_136_liver, 
+                                      control_136_lung = igh_mixcr.f$data$control_136_lung, 
+                                      control_136_mln = igh_mixcr.f$data$control_136_mln),
+                   control_164 = list(control_164_liver = igh_mixcr.f$data$control_164_liver, 
+                                      control_164_lung = igh_mixcr.f$data$control_164_lung, 
+                                      control_164_mln = igh_mixcr.f$data$control_164_mln),
+                   control_174 = list(control_174_liver = igh_mixcr.f$data$control_174_liver, 
+                                      control_174_lung = igh_mixcr.f$data$control_174_lung, 
+                                      control_174_mln = igh_mixcr.f$data$control_174_mln),
+                   control_188 = list(control_188_liver = igh_mixcr.f$data$control_188_liver, 
+                                      control_188_lung = igh_mixcr.f$data$control_188_lung, 
+                                      control_188_mln = igh_mixcr.f$data$control_188_mln),
+                   control_54 = list(control_54_liver = igh_mixcr.f$data$control_54_liver, 
+                                     control_54_lung = igh_mixcr.f$data$control_54_lung, 
+                                     control_54_mln = igh_mixcr.f$data$control_54_mln),
+                   control_69 = list(control_69_liver = igh_mixcr.f$data$control_69_liver, 
+                                     control_69_lung = igh_mixcr.f$data$control_69_lung, 
+                                     control_69_mln = igh_mixcr.f$data$control_69_mln),
+                   fip_120 = list(fip_120_liver = igh_mixcr.f$data$fip_120_liver, 
+                                  fip_120_mln = igh_mixcr.f$data$fip_120_mln),
+                   fip_142 = list(fip_142_liver = igh_mixcr.f$data$fip_142_liver, 
+                                  fip_142_lung = igh_mixcr.f$data$fip_142_lung, 
+                                  fip_142_mln = igh_mixcr.f$data$fip_142_mln),
+                   fip_172 = list(fip_172_liver = igh_mixcr.f$data$fip_172_liver, 
+                                  fip_172_lung = igh_mixcr.f$data$fip_172_lung, 
+                                  fip_172_mln = igh_mixcr.f$data$fip_172_mln),
+                   fip_192 = list(fip_192_liver = igh_mixcr.f$data$fip_192_liver, 
+                                  fip_192_lung = igh_mixcr.f$data$fip_192_lung, 
+                                  fip_192_mln = igh_mixcr.f$data$fip_192_mln),
+                   fip_37 = list(fip_37_liver = igh_mixcr.f$data$fip_37_liver, 
+                                 fip_37_mln = igh_mixcr.f$data$fip_37_mln),
+                   fip_68 = list(fip_68_liver = igh_mixcr.f$data$fip_68_liver, 
+                                 fip_68_lung = igh_mixcr.f$data$fip_68_lung, 
+                                 fip_68_mln = igh_mixcr.f$data$fip_68_mln),
+                   fip_86 = list(fip_86_liver = igh_mixcr.f$data$fip_86_liver, 
+                                 fip_86_lung = igh_mixcr.f$data$fip_86_lung, 
+                                 fip_86_mln = igh_mixcr.f$data$fip_86_mln),
+                   fip_96 = list(fip_96_liver = igh_mixcr.f$data$fip_96_liver, 
+                                 fip_96_mln = igh_mixcr.f$data$fip_96_mln))
+
+# collapse lists to single df for each cat
+all.f.df <- lapply(all.f.list, function(x) bind_rows(x, .id = 'Sample'))
+
+# add tissue
+all.f.df <- lapply(all.f.df, function(x) {
+  x$Tissue <- ifelse(grepl('liver', x$Sample), 'Liver',
+                              ifelse(grepl('lung', x$Sample), 'Lung', 'MLN'))
+  x
+})
+
+# build networks
+all.f.net <- lapply(all.f.df, function(x) {
+  buildNet(data = x,
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+# subsample clusters in each network 1000 times
+all.f.clustsamples <- lapply(all.f.net, function(x) {
+  replicate(1000, sample(x$cluster_data$cluster_id, 2000, replace = FALSE), simplify = FALSE)
+})
+
+# for each sample, extract nodes in sampled clusters
+control_135.samples <- lapply(all.f.clustsamples$control_135, function(x) {
+  buildNet(data = subset(all.f.net$control_135$node_data[all.f.net$control_135$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_136.samples <- lapply(all.f.clustsamples$control_136, function(x) {
+  buildNet(data = subset(all.f.net$control_136$node_data[all.f.net$control_136$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_164.samples <- lapply(all.f.clustsamples$control_164, function(x) {
+  buildNet(data = subset(all.f.net$control_164$node_data[all.f.net$control_164$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_174.samples <- lapply(all.f.clustsamples$control_174, function(x) {
+  buildNet(data = subset(all.f.net$control_174$node_data[all.f.net$control_174$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_188.samples <- lapply(all.f.clustsamples$control_188, function(x) {
+  buildNet(data = subset(all.f.net$control_188$node_data[all.f.net$control_188$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_54.samples <- lapply(all.f.clustsamples$control_54, function(x) {
+  buildNet(data = subset(all.f.net$control_54$node_data[all.f.net$control_54$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+control_69.samples <- lapply(all.f.clustsamples$control_69, function(x) {
+  buildNet(data = subset(all.f.net$control_69$node_data[all.f.net$control_69$node_data$cluster_id %in% x,], 
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_142.samples <- lapply(all.f.clustsamples$fip_142, function(x) {
+  buildNet(data = subset(all.f.net$fip_142$node_data[all.f.net$fip_142$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_172.samples <- lapply(all.f.clustsamples$fip_172, function(x) {
+  buildNet(data = subset(all.f.net$fip_172$node_data[all.f.net$fip_172$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_192.samples <- lapply(all.f.clustsamples$fip_192, function(x) {
+  buildNet(data = subset(all.f.net$fip_192$node_data[all.f.net$fip_192$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_37.samples <- lapply(all.f.clustsamples$fip_37, function(x) {
+  buildNet(data = subset(all.f.net$fip_37$node_data[all.f.net$fip_37$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_68.samples <- lapply(all.f.clustsamples$fip_68, function(x) {
+  buildNet(data = subset(all.f.net$fip_68$node_data[all.f.net$fip_68$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_86.samples <- lapply(all.f.clustsamples$fip_86, function(x) {
+  buildNet(data = subset(all.f.net$fip_86$node_data[all.f.net$fip_86$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+fip_96.samples <- lapply(all.f.clustsamples$fip_96, function(x) {
+  buildNet(data = subset(all.f.net$fip_96$node_data[all.f.net$fip_96$node_data$cluster_id %in% x,],
+                         select = c(1:5, Tissue)),
+           seq_col = 'CDR3.nt',
+           count_col = 'Proportion',
+           color_nodes_by = 'Tissue',
+           size_nodes_by = 'Proportion',
+           drop_isolated_nodes = FALSE,
+           node_stats = TRUE,
+           cluster_stats = TRUE)
+})
+
+all.samples <- list(fip_142 = fip_142.samples,
+                    fip_172 = fip_172.samples,
+                    fip_192 = fip_192.samples,
+                    fip_120 = fip_120.samples,
+                    fip_37 = fip_37.samples,
+                    fip_68 = fip_68.samples,
+                    fip_86 = fip_86.samples,
+                    fip_96 = fip_96.samples,
+                    control_135 = control_135.samples,
+                    control_136 = control_136.samples,
+                    control_164 = control_164.samples,
+                    control_174 = control_174.samples,
+                    control_188 = control_188.samples,
+                    control_54 = control_54.samples,
+                    control_69 = control_69.samples)
+
+# for each sample, get the median largest cluster size of all samples
+cluster.sizes <- as.data.frame(t(data.frame(lapply(all.samples, function(x) median(sapply(x, function(y) max(y$cluster_data$node_count)))))))
+
+# add group info
+cluster.sizes$group <- ifelse(grepl('control', rownames(cluster.sizes)), 'Control', 'FIP')
+cluster.sizes$group2 <- ifelse(grepl('142|192', rownames(cluster.sizes)), 'FIP (focal renal)', cluster.sizes$group)
+
+# plot
+library(ggplot2)
+
+ggplot(cluster.sizes, aes(group, V1, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, show.legend = FALSE) +
+  geom_jitter(aes(color = group2), width = 0.1, show.legend = TRUE) +
+  scale_y_continuous(limits = c(0,80)) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  labs(x = '', y = 'Median largest cluster size') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+wilcox.test(cluster.sizes[cluster.sizes$group == 'FIP',]$V1, cluster.sizes[cluster.sizes$group == 'Control',]$V1)
+
+# get the number of multi-tissue clusters (>1 node) in each sample
+# adjust this to only MLN and Liver, as these tissues are included for all samples
+# cast a matrix of clone counts per tissue, by cluster_id
+all.samples.multimat <- suppressMessages(lapply(all.samples, function(x) lapply(x, function(y) as.data.frame(reshape2::acast(y$node_data, cluster_id ~ Tissue, fill = 0)))))
+
+# remove lung
+all.samples.multimat <- lapply(all.samples.multimat, function(x) lapply(x, function(y) subset(y, select = c(MLN, Liver))))
+
+# add variable for multi-tissue clusters
+all.samples.multimat <- lapply(all.samples.multimat, function(x) 
+  lapply(x, function(y) {
+    y$multitissue <- rowSums(y > 0) > 1
+    y
+}))
+
+# get mean number of multi-tissue clusters per sample
+mean.multi <- lapply(all.samples.multimat, function(x) mean(unlist(lapply(x, function(y) nrow(y[y$multitissue == TRUE,])))))
+
+# unlist and plot
+mean.multi.df <- data.frame(meanmulti = unlist(mean.multi), sample = names(mean.multi))
+mean.multi.df$group <- ifelse(grepl('control', rownames(mean.multi.df)), 'Control', 'FIP')
+mean.multi.df$group2 <- ifelse(grepl('142|192', rownames(mean.multi.df)), 'FIP (focal renal)', mean.multi.df$group)
+
+ggplot(mean.multi.df, aes(group, meanmulti, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, show.legend = FALSE) +
+  geom_jitter(aes(color = group2), width = 0.1, show.legend = TRUE) +
+  # scale_y_continuous(limits = c(0,80)) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  labs(x = '', y = 'Mean cross-tissue clusters (MLN - Liver)') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+wilcox.test(mean.multi.df[mean.multi.df$group == 'FIP',]$meanmulti, mean.multi.df[mean.multi.df$group == 'Control',]$meanmulti)
+```
+
+Plot representative networks.
+
+```{r alltissues_nair_repnetworks}
+library(NAIR)
+library(igraph)
+library(ggraph)
+library(netdiffuseR)
+library(qgraph)
+
+# select representative clusters for plotting
+# control_135 - median 18
+control_135.clustsizes <- data.frame(max.cluster = unlist(lapply(control_135.samples, function(x) max(x$cluster_data$node_count))))
+control_135.clustsizes$sample <- row.names(control_135.clustsizes)
+
+# select rows with a max cluster size of 18
+control_135.clustsizes.median <- control_135.clustsizes[control_135.clustsizes$max.cluster == 18,]
+
+# randomly select a representative sample
+sample(control_135.clustsizes.median$sample, 1)
+
+# plot sample 202
+control_135.net <- control_135.samples[[202]]$igraph
+V(control_135.net)$size <- control_135.samples[[202]]$node_data$Proportion
+V(control_135.net)$tissue <- control_135.samples[[202]]$node_data$Tissue
+
+layout135 = qgraph.layout.fruchtermanreingold(as_edgelist(control_135.net ,names = FALSE), 
+                                              vcount = vcount(control_135.net), 
+                                              area = 10 * vcount(control_135.net)^2)
+
+ggraph(control_135.net, layout = layout135) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_135.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_135.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_136 - median 16
+control_136.clustsizes <- data.frame(max.cluster = unlist(lapply(control_136.samples, function(x) max(x$cluster_data$node_count))))
+control_136.clustsizes$sample <- row.names(control_136.clustsizes)
+
+# select rows with a max cluster size of 18
+control_136.clustsizes.median <- control_136.clustsizes[control_136.clustsizes$max.cluster == 16,]
+
+# randomly select a representative sample
+sample(control_136.clustsizes.median$sample, 1)
+
+# plot sample 507
+control_136.net <- control_136.samples[[507]]$igraph
+V(control_136.net)$size <- control_136.samples[[507]]$node_data$Proportion
+V(control_136.net)$tissue <- control_136.samples[[507]]$node_data$Tissue
+
+layout136 = qgraph.layout.fruchtermanreingold(as_edgelist(control_136.net ,names = FALSE), 
+                                              vcount = vcount(control_136.net), 
+                                              area = 10 * vcount(control_136.net)^2)
+
+ggraph(control_136.net, layout = layout136) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_136.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_136.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_164 - median 73
+control_164.clustsizes <- data.frame(max.cluster = unlist(lapply(control_164.samples, function(x) max(x$cluster_data$node_count))))
+control_164.clustsizes$sample <- row.names(control_164.clustsizes)
+
+# select rows with a max cluster size of 73
+control_164.clustsizes.median <- control_164.clustsizes[control_164.clustsizes$max.cluster == 73,]
+
+# randomly select a representative sample
+sample(control_164.clustsizes.median$sample, 1)
+
+# plot sample 612
+control_164.net <- control_164.samples[[612]]$igraph
+V(control_164.net)$size <- control_164.samples[[612]]$node_data$Proportion
+V(control_164.net)$tissue <- control_164.samples[[612]]$node_data$Tissue
+
+layout164 = qgraph.layout.fruchtermanreingold(as_edgelist(control_164.net ,names = FALSE), 
+                                              vcount = vcount(control_164.net), 
+                                              area = 10 * vcount(control_164.net)^2)
+
+ggraph(control_164.net, layout = layout164) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_164.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_164.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_174 - median 10
+control_174.clustsizes <- data.frame(max.cluster = unlist(lapply(control_174.samples, function(x) max(x$cluster_data$node_count))))
+control_174.clustsizes$sample <- row.names(control_174.clustsizes)
+
+# select rows with a max cluster size of 73
+control_174.clustsizes.median <- control_174.clustsizes[control_174.clustsizes$max.cluster == 10,]
+
+# randomly select a representative sample
+sample(control_174.clustsizes.median$sample, 1)
+
+# plot sample 617
+control_174.net <- control_174.samples[[617]]$igraph
+V(control_174.net)$size <- control_174.samples[[617]]$node_data$Proportion
+V(control_174.net)$tissue <- control_174.samples[[617]]$node_data$Tissue
+
+layout174 = qgraph.layout.fruchtermanreingold(as_edgelist(control_174.net ,names = FALSE), 
+                                              vcount = vcount(control_174.net), 
+                                              area = 10 * vcount(control_174.net)^2)
+
+ggraph(control_174.net, layout = layout174) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_174.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_174.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_188 - median 18
+control_188.clustsizes <- data.frame(max.cluster = unlist(lapply(control_188.samples, function(x) max(x$cluster_data$node_count))))
+control_188.clustsizes$sample <- row.names(control_188.clustsizes)
+
+# select rows with a max cluster size of 73
+control_188.clustsizes.median <- control_188.clustsizes[control_188.clustsizes$max.cluster == 18,]
+
+# randomly select a representative sample
+sample(control_188.clustsizes.median$sample, 1)
+
+# plot sample 70
+control_188.net <- control_188.samples[[70]]$igraph
+V(control_188.net)$size <- control_188.samples[[70]]$node_data$Proportion
+V(control_188.net)$tissue <- control_188.samples[[70]]$node_data$Tissue
+
+layout188 = qgraph.layout.fruchtermanreingold(as_edgelist(control_188.net ,names = FALSE), 
+                                              vcount = vcount(control_188.net), 
+                                              area = 10 * vcount(control_188.net)^2)
+
+ggraph(control_188.net, layout = layout188) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_188.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_188.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_54 - median 13
+control_54.clustsizes <- data.frame(max.cluster = unlist(lapply(control_54.samples, function(x) max(x$cluster_data$node_count))))
+control_54.clustsizes$sample <- row.names(control_54.clustsizes)
+
+# select rows with a max cluster size of 73
+control_54.clustsizes.median <- control_54.clustsizes[control_54.clustsizes$max.cluster == 13,]
+
+# randomly select a representative sample
+sample(control_54.clustsizes.median$sample, 1)
+
+# plot sample 676
+control_54.net <- control_54.samples[[676]]$igraph
+V(control_54.net)$size <- control_54.samples[[676]]$node_data$Proportion
+V(control_54.net)$tissue <- control_54.samples[[676]]$node_data$Tissue
+
+layout54 = qgraph.layout.fruchtermanreingold(as_edgelist(control_54.net ,names = FALSE), 
+                                              vcount = vcount(control_54.net), 
+                                              area = 10 * vcount(control_54.net)^2)
+
+ggraph(control_54.net, layout = layout54) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_54.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_54.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# control_69 - median 17
+control_69.clustsizes <- data.frame(max.cluster = unlist(lapply(control_69.samples, function(x) max(x$cluster_data$node_count))))
+control_69.clustsizes$sample <- row.names(control_69.clustsizes)
+
+# select rows with a max cluster size of 73
+control_69.clustsizes.median <- control_69.clustsizes[control_69.clustsizes$max.cluster == 17,]
+
+# randomly select a representative sample
+sample(control_69.clustsizes.median$sample, 1)
+
+# plot sample 1000
+control_69.net <- control_69.samples[[1000]]$igraph
+V(control_69.net)$size <- control_69.samples[[1000]]$node_data$Proportion
+V(control_69.net)$tissue <- control_69.samples[[1000]]$node_data$Tissue
+
+layout69 = qgraph.layout.fruchtermanreingold(as_edgelist(control_69.net ,names = FALSE), 
+                                              vcount = vcount(control_69.net), 
+                                              area = 10 * vcount(control_69.net)^2)
+
+ggraph(control_69.net, layout = layout69) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(control_69.net)$tissue), 
+                    size = rescale_vertex_igraph(V(control_69.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_142 - median 15
+fip_142.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_142.samples, function(x) max(x$cluster_data$node_count))))
+fip_142.clustsizes$sample <- row.names(fip_142.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_142.clustsizes.median <- fip_142.clustsizes[fip_142.clustsizes$max.cluster == 15,]
+
+# randomly select a representative sample
+sample(fip_142.clustsizes.median$sample, 1)
+
+# plot sample 322
+fip_142.net <- fip_142.samples[[322]]$igraph
+V(fip_142.net)$size <- fip_142.samples[[322]]$node_data$Proportion
+V(fip_142.net)$tissue <- fip_142.samples[[322]]$node_data$Tissue
+
+layout142 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_142.net ,names = FALSE), 
+                                              vcount = vcount(fip_142.net), 
+                                              area = 10 * vcount(fip_142.net)^2)
+
+ggraph(fip_142.net, layout = layout142) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_142.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_142.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_172 - median 34
+fip_172.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_172.samples, function(x) max(x$cluster_data$node_count))))
+fip_172.clustsizes$sample <- row.names(fip_172.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_172.clustsizes.median <- fip_172.clustsizes[fip_172.clustsizes$max.cluster == 34,]
+
+# randomly select a representative sample
+sample(fip_172.clustsizes.median$sample, 1)
+
+# plot sample 957
+fip_172.net <- fip_172.samples[[957]]$igraph
+V(fip_172.net)$size <- fip_172.samples[[957]]$node_data$Proportion
+V(fip_172.net)$tissue <- fip_172.samples[[957]]$node_data$Tissue
+
+layout172 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_172.net ,names = FALSE), 
+                                              vcount = vcount(fip_172.net), 
+                                              area = 10 * vcount(fip_172.net)^2)
+
+ggraph(fip_172.net, layout = layout172) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_172.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_172.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_192 - median 34
+fip_192.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_192.samples, function(x) max(x$cluster_data$node_count))))
+fip_192.clustsizes$sample <- row.names(fip_192.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_192.clustsizes.median <- fip_192.clustsizes[fip_192.clustsizes$max.cluster == 34,]
+
+# randomly select a representative sample
+sample(fip_192.clustsizes.median$sample, 1)
+
+# plot sample 368
+fip_192.net <- fip_192.samples[[368]]$igraph
+V(fip_192.net)$size <- fip_192.samples[[368]]$node_data$Proportion
+V(fip_192.net)$tissue <- fip_192.samples[[368]]$node_data$Tissue
+
+layout192 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_192.net ,names = FALSE), 
+                                              vcount = vcount(fip_192.net), 
+                                              area = 10 * vcount(fip_192.net)^2)
+
+ggraph(fip_192.net, layout = layout192) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_192.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_192.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_120 - median 34
+fip_120.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_120.samples, function(x) max(x$cluster_data$node_count))))
+fip_120.clustsizes$sample <- row.names(fip_120.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_120.clustsizes.median <- fip_120.clustsizes[fip_120.clustsizes$max.cluster == 34,]
+
+# randomly select a representative sample
+sample(fip_120.clustsizes.median$sample, 1)
+
+# plot sample 111
+fip_120.net <- fip_120.samples[[111]]$igraph
+V(fip_120.net)$size <- fip_120.samples[[111]]$node_data$Proportion
+V(fip_120.net)$tissue <- fip_120.samples[[111]]$node_data$Tissue
+
+layout120 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_120.net ,names = FALSE), 
+                                              vcount = vcount(fip_120.net), 
+                                              area = 10 * vcount(fip_120.net)^2)
+
+ggraph(fip_120.net, layout = layout120) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_120.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_120.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_37 - median 36
+fip_37.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_37.samples, function(x) max(x$cluster_data$node_count))))
+fip_37.clustsizes$sample <- row.names(fip_37.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_37.clustsizes.median <- fip_37.clustsizes[fip_37.clustsizes$max.cluster == 36,]
+
+# randomly select a representative sample
+sample(fip_37.clustsizes.median$sample, 1)
+
+# plot sample 738
+fip_37.net <- fip_37.samples[[738]]$igraph
+V(fip_37.net)$size <- fip_37.samples[[738]]$node_data$Proportion
+V(fip_37.net)$tissue <- fip_37.samples[[738]]$node_data$Tissue
+
+layout37 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_37.net ,names = FALSE), 
+                                              vcount = vcount(fip_37.net), 
+                                              area = 10 * vcount(fip_37.net)^2)
+
+ggraph(fip_37.net, layout = layout37) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_37.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_37.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_68 - median 57
+fip_68.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_68.samples, function(x) max(x$cluster_data$node_count))))
+fip_68.clustsizes$sample <- row.names(fip_68.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_68.clustsizes.median <- fip_68.clustsizes[fip_68.clustsizes$max.cluster == 57,]
+
+# randomly select a representative sample
+sample(fip_68.clustsizes.median$sample, 1)
+
+# plot sample 832
+fip_68.net <- fip_68.samples[[832]]$igraph
+V(fip_68.net)$size <- fip_68.samples[[832]]$node_data$Proportion
+V(fip_68.net)$tissue <- fip_68.samples[[832]]$node_data$Tissue
+
+layout68 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_68.net ,names = FALSE), 
+                                              vcount = vcount(fip_68.net), 
+                                              area = 10 * vcount(fip_68.net)^2)
+
+ggraph(fip_68.net, layout = layout68) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_68.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_68.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_86 - median 65
+fip_86.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_86.samples, function(x) max(x$cluster_data$node_count))))
+fip_86.clustsizes$sample <- row.names(fip_86.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_86.clustsizes.median <- fip_86.clustsizes[fip_86.clustsizes$max.cluster == 65,]
+
+# randomly select a representative sample
+sample(fip_86.clustsizes.median$sample, 1)
+
+# plot sample 840
+fip_86.net <- fip_86.samples[[840]]$igraph
+V(fip_86.net)$size <- fip_86.samples[[840]]$node_data$Proportion
+V(fip_86.net)$tissue <- fip_86.samples[[840]]$node_data$Tissue
+
+layout86 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_86.net ,names = FALSE), 
+                                              vcount = vcount(fip_86.net), 
+                                              area = 10 * vcount(fip_86.net)^2)
+
+ggraph(fip_86.net, layout = layout86) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_86.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_86.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#5EC64F', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+
+# fip_96 - median 26
+fip_96.clustsizes <- data.frame(max.cluster = unlist(lapply(fip_96.samples, function(x) max(x$cluster_data$node_count))))
+fip_96.clustsizes$sample <- row.names(fip_96.clustsizes)
+
+# select rows with a max cluster size of 73
+fip_96.clustsizes.median <- fip_96.clustsizes[fip_96.clustsizes$max.cluster == 26,]
+
+# randomly select a representative sample
+sample(fip_96.clustsizes.median$sample, 1)
+
+# plot sample 138
+fip_96.net <- fip_96.samples[[138]]$igraph
+V(fip_96.net)$size <- fip_96.samples[[138]]$node_data$Proportion
+V(fip_96.net)$tissue <- fip_96.samples[[138]]$node_data$Tissue
+
+layout96 = qgraph.layout.fruchtermanreingold(as_edgelist(fip_96.net ,names = FALSE), 
+                                              vcount = vcount(fip_96.net), 
+                                              area = 10 * vcount(fip_96.net)^2)
+
+ggraph(fip_96.net, layout = layout96) +
+    geom_edge_link(color = "black", width = 0.3) +
+    geom_node_point(aes(color = V(fip_96.net)$tissue), 
+                    size = rescale_vertex_igraph(V(fip_96.net)$size, minmax.relative.size = c(0.02, 0.08), adjust = 100)) +
+    scale_color_manual(values = c('#EA8131', '#033BF4')) +
+    labs(color = '') +
+    theme_void()
+```
+
+Construct a global network comprising all clones from all samples, and determine cluster membership from this network.
+
+```{r nair_global_cluster_alt}
+# create df for all clones
+igh_mixcr.f.df <- bind_rows(igh_mixcr.f$data, .id = 'Sample')
+
+# add tissue
+igh_mixcr.f.df$Tissue <- ifelse(grepl('liver', igh_mixcr.f.df$Sample), 'Liver',
+                              ifelse(grepl('lung', igh_mixcr.f.df$Sample), 'Lung', 'MLN'))
+
+# build network
+igh_mixcr.f.net <- buildNet(data = igh_mixcr.f.df,
+                       seq_col = 'CDR3.aa',
+                       count_col = 'Proportion',
+                       color_nodes_by = 'Tissue',
+                       size_nodes_by = 'Proportion',
+                       drop_isolated_nodes = TRUE,
+                       node_stats = TRUE,
+                       cluster_stats = TRUE)
+
+# split node_data by sample and determine overlap (by cluster ID)
+split.list <- split(igh_mixcr.f.net$node_data, igh_mixcr.f.net$node_data$Sample)
+
+split.clust <- lapply(split.list, function(x) {
+  x <- x %>%
+    select(cluster_id) %>%
+    unique()
+})
+
+sample.order <- c("control_54_liver", "control_54_lung", "control_54_mln", "control_69_liver", "control_69_lung", "control_69_mln",
+                  "control_135_liver", "control_135_lung", "control_135_mln", "control_136_liver", "control_136_lung", "control_136_mln",
+                  "control_174_liver", "control_174_lung", "control_174_mln", "control_188_liver", "control_188_lung", "control_188_mln",
+                  "control_164_liver", "control_164_lung", "control_164_mln", "fip_142_liver", "fip_142_lung", "fip_142_mln",
+                  "fip_192_liver", "fip_192_lung", "fip_192_mln", "fip_37_liver", "fip_37_mln", "fip_96_liver", "fip_96_mln",
+                  "fip_120_liver", "fip_120_mln", "fip_172_liver", "fip_172_lung", "fip_172_mln",
+                  "fip_68_liver", "fip_68_lung", "fip_68_mln", "fip_86_liver", "fip_86_lung", "fip_86_mln")
+
+split.ovl <- apply_symm(split.clust[sample.order], function(.x, .y) {
+  .x <- collect(.x, n = Inf)
+  .y <- collect(.y, n = Inf)
+  intersection <- nrow(dplyr::intersect(.x, .y))
+  intersection / (nrow(.x) + nrow(.y) - intersection)
+})
+
+# options for measure of overlap in function above, jaccard preferred
+# # ovlap coef
+# nrow(dplyr::intersect(.x, .y)) / min(nrow(.x), nrow(.y))
+# # jaccard
+# intersection <- nrow(dplyr::intersect(.x, .y))
+# intersection / (nrow(.x) + nrow(.y) - intersection)
+
+# melt and plot with geom_tile
+split.ovl.melt <- reshape2::melt(split.ovl)
+
+# reverse sample order
+split.ovl.melt$Var2 <- factor(split.ovl.melt$Var2, levels = rev(unique(split.ovl.melt$Var2)))
+
+ggplot(split.ovl.melt, aes(Var1, Var2, fill = value)) + 
+  geom_tile() +
+  labs(x = '', y = '', fill = 'Jaccard index') +
+  scale_fill_gradientn(
+   colors=scico::scico(1000, palette = 'vik'),
+   values=scales::rescale(c(0,0.01,0.21)),
+   limits=c(0,0.21)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.border = element_blank())
+
+# plot within and between sample overlap values for FIP and Control
+upper <- which(upper.tri(split.ovl, diag = F), arr.ind = T)
+
+split.upper <- data.frame(first = dimnames(split.ovl)[[2]][upper[,2]],
+                second = dimnames(split.ovl)[[1]][upper[,1]],
+                correlation = split.ovl[upper])
+
+# remove overlaps between FIP and control
+split.upper$group <- ifelse(grepl('control', split.upper$first) & grepl('control', split.upper$second), 'Control',
+                              ifelse(grepl('fip', split.upper$first) & grepl('fip', split.upper$second), 'FIP', 'NA'))
+
+split.upper.filt <- split.upper[split.upper$group != 'NA',]
+
+split.upper.filt$inout <- ifelse(str_split_i(split.upper.filt$first, '_', 2) == str_split_i(split.upper.filt$second, '_', 2), 'Within', 'Between')
+
+library(ggplot2)
+library(ggpubr)
+
+ggplot(split.upper.filt, aes(inout, correlation, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_point(aes(x = inout, y = correlation, color = group), position = position_jitterdodge(dodge.width = 0.9, jitter.width = 0.1)) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_y_continuous(limits = c(0,0.25)) +
+  stat_compare_means(method = 'wilcox.test') +
+  labs(x = 'Cat overlap', y = 'Overlap index (Jaccard)', fill = '', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Look at top clusters (by FIP sample membership) and get seq logos. 
+
+```{r nair_global_cluster_top}
+library(igraph)
+library(ggraph)
+library(netdiffuseR)
+library(qgraph)
+library(ggseqlogo)
+library(ggplot2)
+library(ggpubr)
+
+clust.tab <- as.data.frame(reshape2::acast(igh_mixcr.f.net$node_data, cluster_id ~ Sample, fill = 0))
+clust.tab$nsamples <- rowSums(clust.tab > 0)
+clust.tab$cluster <- rownames(clust.tab)
+clust.tab <- subset(clust.tab, select = c(cluster, nsamples, 1:42))
+
+fip.clust <- clust.tab %>%
+  filter_at(vars(c(3:8, 12:23)), all_vars(. == 0))
+
+control.clust <- clust.tab %>%
+  filter_at(vars(c(24:44)), all_vars(. == 0))
+
+cats.fip.clust <- fip.clust %>%
+  mutate(control_135 = select(., control_135_liver:control_135_mln) %>% rowSums(),
+         control_136 = select(., control_136_liver:control_136_mln) %>% rowSums(),
+         control_164 = select(., control_164_liver:control_164_mln) %>% rowSums(),
+         control_174 = select(., control_174_liver:control_174_mln) %>% rowSums(),
+         control_188 = select(., control_188_liver:control_188_mln) %>% rowSums(),
+         control_54 = select(., control_54_liver:control_54_mln) %>% rowSums(),
+         control_69 = select(., control_69_liver:control_69_mln) %>% rowSums(),
+         fip_120 = select(., fip_120_liver:fip_120_mln) %>% rowSums(),
+         fip_142 = select(., fip_142_liver:fip_142_mln) %>% rowSums(),
+         fip_172 = select(., fip_172_liver:fip_172_mln) %>% rowSums(),
+         fip_192 = select(., fip_192_liver:fip_192_mln) %>% rowSums(),
+         fip_37 = select(., fip_37_liver:fip_37_mln) %>% rowSums(),
+         fip_68 = select(., fip_68_liver:fip_68_mln) %>% rowSums(),
+         fip_86 = select(., fip_86_liver:fip_86_mln) %>% rowSums(),
+         fip_96 = select(., fip_96_liver:fip_96_mln) %>% rowSums())
+
+cats.fip.clust <- subset(cats.fip.clust, select = c(1, 2, 45:59))
+cats.fip.clust$ncats <- rowSums(cats.fip.clust[,3:17] > 0)
+
+# compare CDR3 length of 'shared' clusters to all other clusters
+# define 'shared' clusters as present in at least 2 FIP cats and zero controls
+cats.fip.clust.filt <- cats.fip.clust[cats.fip.clust$ncats > 1,]
+
+fip.shared.clust <- cats.fip.clust.filt$cluster
+other.clust <- clust.tab$cluster[!clust.tab$cluster %in% fip.shared.clust]
+
+cluster.dat <- igh_mixcr.f.net$cluster_data
+cluster.dat$seqlength <- nchar(cluster.dat$seq_w_max_degree)
+cluster.dat$group <- factor(ifelse(cluster.dat$cluster_id %in% fip.shared.clust, 'FIP cluster', 'Other'), levels = c('Other', 'FIP cluster'))
+
+ggplot(cluster.dat, aes(group, seqlength, fill = group)) +
+  geom_boxplot() +
+  stat_compare_means() +
+  theme_bw()
+
+# similar clusters identified - 24, 50, 219, 80, 124
+# add cat id to nodedata for plotting
+igh_mixcr.f.net$node_data$Cat <- paste0(stringr::str_split_i(igh_mixcr.f.net$node_data$Sample, '_', 1), 
+                                        '_', 
+                                        stringr::str_split_i(igh_mixcr.f.net$node_data$Sample, '_', 2))
+
+igh_mixcr.f.net$node_data$Cat <- factor(igh_mixcr.f.net$node_data$Cat, levels = c('control_54','control_69','control_135','control_136','control_174','control_188','control_164','fip_142','fip_192','fip_37','fip_96','fip_120','fip_172','fip_68','fip_86'))
+
+# set colour scale
+cols <- c('#32A7CD', '#D071AD', '#D071AD', '#f4eaf4', '#d2acd3', '#b16eb3', '#8f3092', '#642266', '#0e050f')
+names(cols) <- c('control_164', 'fip_142', 'fip_192', 'fip_37', 'fip_96', 'fip_120', 'fip_172', 'fip_68', 'fip_86')
+
+# plot some top FIP clusters by nsamples - 24, 50, 219, 80, 124
+# cluster 24
+cluster24 <- subset(igh_mixcr.f.net$node_data[igh_mixcr.f.net$node_data$cluster_id == 24,], select = c(1:38, 49))
+
+cluster24.net <- buildNet(data = cluster24,
+                          seq_col = 'CDR3.aa',
+                          count_col = 'Proportion',
+                          color_nodes_by = 'Cat',
+                          size_nodes_by = 'Proportion',
+                          drop_isolated_nodes = FALSE,
+                          node_stats = TRUE,
+                          cluster_stats = TRUE)
+
+# nice plot
+cluster24.ig <- cluster24.net$igraph
+V(cluster24.ig)$size <- cluster24.net$node_data$Proportion
+V(cluster24.ig)$cat <- cluster24.net$node_data$Cat
+
+layout24 = qgraph.layout.fruchtermanreingold(as_edgelist(cluster24.ig, names = FALSE), 
+                                             vcount = vcount(cluster24.ig),
+                                             area = 30 * vcount(cluster24.ig)^2)
+
+ggraph(cluster24.ig, layout = layout24) +
+    geom_edge_link(color = "darkgrey", width = 0.2, alpha = 0.7) +
+    geom_node_point(aes(fill = V(cluster24.ig)$cat), 
+                    size = rescale_vertex_igraph(V(cluster24.ig)$size, minmax.relative.size = c(0.02, 0.08), adjust = 200),
+                    shape = 21, show.legend = TRUE) +
+    scale_fill_manual(values = cols) +
+    labs(fill = '') +
+    theme_void()
+
+# seqlogo
+ggseqlogo(cluster24.net$node_data$CDR3.aa[nchar(cluster24.net$node_data$CDR3.aa) == 11], method = 'bits')
+
+# cluster 50
+cluster50 <- subset(igh_mixcr.f.net$node_data[igh_mixcr.f.net$node_data$cluster_id == 50,], select = c(1:38, 49))
+
+cluster50.net <- buildNet(data = cluster50,
+                          seq_col = 'CDR3.aa',
+                          count_col = 'Proportion',
+                          color_nodes_by = 'Sample',
+                          size_nodes_by = 'Proportion',
+                          drop_isolated_nodes = FALSE,
+                          node_stats = TRUE,
+                          cluster_stats = TRUE)
+
+# nice plot
+cluster50.ig <- cluster50.net$igraph
+V(cluster50.ig)$size <- cluster50.net$node_data$Proportion
+V(cluster50.ig)$cat <- cluster50.net$node_data$Cat
+
+layout50 = qgraph.layout.fruchtermanreingold(as_edgelist(cluster50.ig, names = FALSE), 
+                                             vcount = vcount(cluster50.ig),
+                                             area = 30 * vcount(cluster50.ig)^2)
+
+ggraph(cluster50.ig, layout = layout50) +
+    geom_edge_link(color = "darkgrey", width = 0.2, alpha = 0.7) +
+    geom_node_point(aes(fill = V(cluster50.ig)$cat), 
+                    size = rescale_vertex_igraph(V(cluster50.ig)$size, minmax.relative.size = c(0.02, 0.08), adjust = 200),
+                    shape = 21, show.legend = FALSE) +
+    scale_fill_manual(values = cols) +
+    labs(color = '') +
+    theme_void()
+
+# seqlogo
+ggseqlogo(cluster50.net$node_data$CDR3.aa, method = 'bits')
+
+# cluster 80
+cluster80 <- subset(igh_mixcr.f.net$node_data[igh_mixcr.f.net$node_data$cluster_id == 80,], select = c(1:38, 49))
+
+cluster80.net <- buildNet(data = cluster80,
+                          seq_col = 'CDR3.aa',
+                          count_col = 'Proportion',
+                          color_nodes_by = 'Sample',
+                          size_nodes_by = 'Proportion',
+                          drop_isolated_nodes = FALSE,
+                          node_stats = TRUE,
+                          cluster_stats = TRUE)
+
+# nice plot
+cluster80.ig <- cluster80.net$igraph
+V(cluster80.ig)$size <- cluster80.net$node_data$Proportion
+V(cluster80.ig)$cat <- cluster80.net$node_data$Cat
+
+layout80 = qgraph.layout.fruchtermanreingold(as_edgelist(cluster80.ig, names = FALSE), 
+                                             vcount = vcount(cluster80.ig),
+                                             area = 30 * vcount(cluster80.ig)^2)
+
+ggraph(cluster80.ig, layout = layout80) +
+    geom_edge_link(color = "darkgrey", width = 0.2, alpha = 0.7) +
+    geom_node_point(aes(fill = V(cluster80.ig)$cat), 
+                    size = rescale_vertex_igraph(V(cluster80.ig)$size, minmax.relative.size = c(0.02, 0.08), adjust = 200),
+                    shape = 21, show.legend = FALSE) +
+    scale_fill_manual(values = cols) +
+    labs(color = '') +
+    theme_void()
+
+# seqlogo
+ggseqlogo(cluster80.net$node_data$CDR3.aa, method = 'bits')
+
+# cluster 219
+cluster219 <- subset(igh_mixcr.f.net$node_data[igh_mixcr.f.net$node_data$cluster_id == 219,], select = c(1:38, 49))
+
+cluster219.net <- buildNet(data = cluster219,
+                          seq_col = 'CDR3.aa',
+                          count_col = 'Proportion',
+                          color_nodes_by = 'Sample',
+                          size_nodes_by = 'Proportion',
+                          drop_isolated_nodes = FALSE,
+                          node_stats = TRUE,
+                          cluster_stats = TRUE)
+
+# seqlogo
+ggseqlogo(cluster219.net$node_data$CDR3.aa, method = 'bits')
+
+# cluster 124
+cluster124 <- subset(igh_mixcr.f.net$node_data[igh_mixcr.f.net$node_data$cluster_id == 124,], select = c(1:38, 49))
+
+cluster124.net <- buildNet(data = cluster124,
+                          seq_col = 'CDR3.aa',
+                          count_col = 'Proportion',
+                          color_nodes_by = 'Sample',
+                          size_nodes_by = 'Proportion',
+                          drop_isolated_nodes = FALSE,
+                          node_stats = TRUE,
+                          cluster_stats = TRUE)
+
+# seqlogo
+ggseqlogo(cluster124.net$node_data$CDR3.aa, method = 'bits')
+```
+
+## Somatic hypermutation analysis
+
+To detect mutations in IGH VDJ sequences, clonotypes were re-assembled for all samples using MiXCR with the option `--assemble-contigs-by VDJRegion` mix-in option. Allelic variation was then accounted for by re-assigning clonotypes to alleles using MiXCR's `findAlleles` function:
+
+```{r mixcr_find_alleles_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J mixcr_find_alleles.job 
+#SBATCH -o mixcr_find_alleles.%A_%a.out 
+#SBATCH -c 2
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+cats=()
+for cat in *_mln_merged.contigs.clns
+do
+        cat=${cat%_mln_merged.contigs.clns}
+        cats[${#cats[@]}]=$cat
+done
+
+# create input file variables if the file exists, otherwise leave them empty
+if [ -e "${cats[$i]}_liver_merged.contigs.clns" ]
+then
+	liverfile=$path/${cats[$i]}_liver_merged.contigs.clns
+else
+	liverfile=""
+fi
+
+if [ -e "${cats[$i]}_lung_merged.contigs.clns" ]
+then
+	lungfile=$path/${cats[$i]}_lung_merged.contigs.clns
+else
+	lungfile=""
+fi
+
+if [ -e "${cats[$i]}_mln_merged.contigs.clns" ]
+then
+	mlnfile=$path/${cats[$i]}_mln_merged.contigs.clns
+else
+	mlnfile=""
+fi
+
+outpath=findAlleles
+
+#function
+mixcr findAlleles \
+      --report $outpath/${cats[$i]}.findAlleles.report.txt \
+      --export-alleles-mutations $outpath/${cats[$i]}_alleles.tsv \
+      --export-library $outpath/${cats[$i]}_alleles.json \
+      --output-template $outpath/{file_name}.reassigned.clns \
+      $liverfile $lungfile $mlnfile
+```
+
+```{r mixcr_find_alleles_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+cats=()
+for cat in *_mln_merged.contigs.clns
+do
+        cat=${cat%_mln_merged.contigs.clns}
+        cats[${#cats[@]}]=$cat
+done
+catcount=${#cats[@]}
+
+sbatch --array 1-$catcount:1 mixcr_find_alleles_secondary.sh
+```
+
+Full-length clonotypes were then exported in AIRR format using MiXCR's `exportAirr`:
+
+```{r mixcr_export_airr_secondary, engine = 'bash', eval = FALSE}
+#!/bin/bash 
+#SBATCH -J mixcr_export_airr_secondary.job 
+#SBATCH -o mixcr_export_airr_secondary.%A_%a.out 
+#SBATCH -c 1
+
+let i=$SLURM_ARRAY_TASK_ID-1
+
+path=`pwd`
+
+files=()
+for file in *_merged.contigs.reassigned.clns
+do
+        file=${file%_merged.contigs.reassigned.clns}
+        files[${#files[@]}]=$file
+done
+
+clnsfile=$path/${files[$i]}_merged.contigs.reassigned.clns
+
+outpath=airr
+
+mixcr exportAirr \
+    --imgt-gaps \
+    $clnsfile \
+    $outpath/${files[$i]}_airr_condatest.tsv
+```
+
+```{r mixcr_export_airr_primary, engine = 'bash', eval = FALSE}
+#!/bin/bash
+files=()
+for file in *_merged.contigs.reassigned.clns
+do
+        file=${file%_merged.contigs.reassigned.clns}
+        files[${#files[@]}]=$file
+done
+filecount=${#files[@]}
+
+sbatch --array 1-$filecount:1 mixcr_export_airr_secondary.sh
+```
+
+Analyse mutations using [Shazam](https://shazam.readthedocs.io/en/stable/).
+
+```{r shazam_mutation_analysis}
+# read in AIRR format data
+airr.files <- list.files('mixcr/IGH/fulllength/findAlleles/airr', pattern = '.tsv', full.names = TRUE)
+airr.id <- airr.files %>% substr(46, nchar(.)-19) %>% unique()
+airr.list <- lapply(airr.files, function(x) read.csv(x, sep = '\t', quote = ""))
+names(airr.list) <- airr.id
+
+# calculate R(eplacement) and S(ilent) mutation counts for all samples
+library(alakazam)
+library(shazam)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+
+db_obs <- lapply(airr.list, function(x) {
+  observedMutations(x, sequenceColumn = "sequence_alignment",
+                    germlineColumn = "germline_alignment",
+                    regionDefinition = NULL,
+                    frequency = TRUE,
+                    nproc = 2)
+})
+
+# extract mutation freqs for all samples
+mut.freq <- lapply(db_obs, function(x) {
+  x %>% select(sequence_id, c_call, starts_with("mu_freq"))
+})
+
+# collapse IGHG subtypes
+mut.freq <- mut.freq %>%
+  map(~ .x %>% mutate(c_call = gsub('IGHG1|IGHG2|IGHG3', 'IGHG', c_call)))
+
+# get mean frequency in each sample and collapse to single dataframe
+# add metadata for plotting
+mut.freq.summ <- lapply(mut.freq, function(x) {
+  x %>%
+  summarise(.by = c_call, meanRmut = mean(mu_freq_seq_r), meanSmut = mean(mu_freq_seq_s)) %>%
+  complete(c_call = c('IGHM', 'IGHA', 'IGHD', 'IGHE', 'IGHG', ''), fill = list(meanRmut = 0, meanSmut = 0))
+})
+
+mut.freq.all <- bind_rows(mut.freq.summ, .id = 'Sample')
+
+mut.freq.all$Group <- ifelse(grepl('control', mut.freq.all$Sample), 'Control', 'FIP')
+mut.freq.all$Tissue <- ifelse(grepl('liver', mut.freq.all$Sample), 'Liver', 
+                              ifelse(grepl('lung', mut.freq.all$Sample), 'Lung', 
+                                     'MLN'))
+mut.freq.all$Group2 <- ifelse(grepl('142|192', mut.freq.all$Sample), 'FIP (focal renal)', mut.freq.all$Group)
+
+# plot mean freq in FIP vs Control for IGHG
+# R mutations
+r.plot <- ggplot(mut.freq.all[mut.freq.all$c_call == 'IGHG',], aes(Group, meanRmut, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = Group2), width = 0.1) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_y_continuous(limits = c(0,0.06), breaks = seq(0,0.06,0.01)) +
+  labs(x = '', y = 'Mean replacement mutation frequency', fill = '') +
+  stat_compare_means() +
+  facet_grid(rows = vars(c_call), cols = vars(Tissue)) +
+  ggtitle('IGHG') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+# S mutations
+s.plot <- ggplot(mut.freq.all[mut.freq.all$c_call == 'IGHG',], aes(Group, meanSmut, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, show.legend = FALSE) +
+  geom_jitter(aes(color = Group2), width = 0.1, show.legend = TRUE) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092', '#D071AD')) +
+  scale_y_continuous(limits = c(0,0.035), breaks = seq(0,0.04,0.01)) +
+  labs(x = '', y = 'Mean silent mutation frequency', fill = '') +
+  stat_compare_means() +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  ggtitle('IGHG') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+compare_means(meanSmut ~ Group, data = mut.freq.all[mut.freq.all$c_call == 'IGHG',], group.by = 'Tissue', method = 'wilcox.test', p.adjust.method = 'bonferroni')
+
+library(cowplot)
+
+plot_grid(r.plot, s.plot, nrow = 2)
+
+# should plot this by FCoV positivity, as expect the relationship to be even stronger...
+# convert fcov data to annotations
+fcov$virPos <- ifelse(fcov$value > -6.38, TRUE, FALSE)
+
+mut.freq.all.virPos <- merge(mut.freq.all, fcov[,4:5], by = 'Sample', all.x = TRUE)
+# replace NAs
+mut.freq.all.virPos$virPos[is.na(mut.freq.all.virPos$virPos)] <- FALSE
+
+# plot
+# R mutations
+ggplot(mut.freq.all.virPos[mut.freq.all.virPos$c_call == 'IGHG',], aes(virPos, meanRmut, fill = virPos)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = Group), width = 0.1) +
+  scale_fill_manual(values = c('white', 'grey')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# S mutations
+ggplot(mut.freq.all.virPos[mut.freq.all.virPos$c_call == 'IGHG',], aes(virPos, meanSmut, fill = virPos)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(aes(color = Group), width = 0.1) +
+  scale_fill_manual(values = c('white', 'grey')) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  stat_compare_means() +
+  facet_wrap(vars(Tissue), nrow = 1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# plot the density of mutations in FIP and Control tissue samples
+mut.freq.dens <- bind_rows(mut.freq, .id = 'Sample')
+
+# add metadata
+mut.freq.dens$Group <- ifelse(grepl('control', mut.freq.dens$Sample), 'Control', 'FIP')
+mut.freq.dens$Tissue <- ifelse(grepl('liver', mut.freq.dens$Sample), 'Liver', 
+                              ifelse(grepl('lung', mut.freq.dens$Sample), 'Lung', 
+                                     'MLN'))
+mut.freq.dens$Cat <- str_split_i(mut.freq.dens$Sample, '_', 2)
+mut.freq.dens$Cat <- factor(mut.freq.dens$Cat, levels = c(54, 69, 135, 136, 164, 174, 188, 37, 68, 86, 96, 120, 142, 172, 192))
+
+# set factor levels
+mut.freq.dens$c_call <- factor(mut.freq.dens$c_call, levels = c('IGHM', 'IGHG', 'IGHA'))
+
+ggplot(mut.freq.dens[mut.freq.dens$c_call %in% c('IGHM', 'IGHG', 'IGHA'),], aes(x = mu_freq_seq_s, colour = Group)) +
+  geom_density(bw = 0.005) +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,60)) +
+  facet_grid(rows = vars(Tissue), cols = vars(c_call)) +
+  labs(x = 'Silent mutation frequency', y = 'Density', color = '') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# alt boxplots
+ggplot(mut.freq.dens[mut.freq.dens$c_call %in% c('IGHM', 'IGHG', 'IGHA'),], aes(x = Group, y = mu_freq_seq_r)) +
+  geom_boxplot(aes(fill = Group), alpha = 0.5, outlier.shape = NA) +
+  geom_jitter(aes(colour = Group), width = 0.1, show.legend = F) +
+  stat_compare_means() +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  facet_grid(rows = vars(c_call), cols = vars(Tissue)) +
+  theme_bw()
+
+ggplot(mut.freq.dens[mut.freq.dens$c_call %in% c('IGHM', 'IGHG', 'IGHA'),], aes(x = Group, y = mu_freq_seq_s)) +
+  geom_boxplot(aes(fill = Group), alpha = 0.5, outlier.shape = NA) +
+  geom_jitter(aes(colour = Group), width = 0.1, show.legend = F) +
+  stat_compare_means() +
+  scale_color_manual(values = c('#32A7CD', '#8F3092')) +
+  scale_fill_manual(values = c('#32A7CD', '#8F3092')) +
+  facet_grid(rows = vars(c_call), cols = vars(Tissue)) +
+  theme_bw()
+
+# add age
+control.igg$cat <- str_split_i(control.igg$Sample, pattern = '_', i = 2)
+
+cat.age <- read.csv(file = 'tables/cat_ages.txt', sep = '\t', header = TRUE)
+cat.age$cat <- str_split_i(cat.age$cat, pattern = '_', i = 2)
+
+control.igg.age <- merge(control.igg, cat.age, by = 'cat', all.x = TRUE)
+
+# MLN only
+control.igg.age <- control.igg.age[control.igg.age$Tissue == 'MLN',]
+
+ggplot(control.igg.age, aes(age, meanSmut)) +
+  geom_point(color = '#32A7CD') +
+  geom_smooth(method = 'lm', se = FALSE, color = '#32A7CD') +
+  scale_x_continuous(expand = c(0,0), limits = c(0,200)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.03)) +
+  labs(x = 'Age (months)', y = 'Mean silent mutation frequency') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+cor.test(control.igg.age$meanSmut, control.igg.age$age)
+
+summary(lm(meanSmut ~ age + cat, data = control.igg.age))
+
+# FIP cats
+fip.igg <- mut.freq.all[mut.freq.all$Group == 'FIP' & mut.freq.all$c_call == 'IGHG',]
+
+# add age
+fip.igg$cat <- str_split_i(fip.igg$Sample, pattern = '_', i = 2)
+
+cat.age <- read.csv(file = 'tables/cat_ages.txt', sep = '\t', header = TRUE)
+cat.age$cat <- str_split_i(cat.age$cat, pattern = '_', i = 2)
+
+fip.igg.age <- merge(fip.igg, cat.age, by = 'cat', all.x = TRUE)
+
+# MLN only
+fip.igg.age <- fip.igg.age[fip.igg.age$Tissue == 'MLN',]
+# exclude 37
+fip.igg.age <- fip.igg.age[fip.igg.age$cat != 37,]
+
+ggplot(fip.igg.age, aes(age, meanSmut)) +
+  geom_point(color = '#8F3092') +
+  geom_smooth(method = 'lm', se = FALSE, color = '#8F3092') +
+  scale_x_continuous(expand = c(0,0), limits = c(0,40)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.02)) +
+  labs(x = 'Age (months)', y = 'Mean silent mutation frequency') +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+cor.test(fip.igg.age$meanSmut, fip.igg.age$age)
+
+summary(lm(meanSmut ~ age + Tissue + cat, data = fip.igg.age))
+```
+
+Estimate selection scores.
+
+```{r shazam_selection}
+# use all clones from all control samples (collapsed clones) to infer full targeting model
+controls.airr <- airr.list[grepl('control_', names(airr.list))]
+# add names as sample column
+for (i in seq_along(controls.airr)) {
+  controls.airr[[i]]$Sample <- names(controls.airr[i])
+}
+
+# filter down to IGHG, remove rows with blank sequence_alignment, reformat clone_id and sequence_id
+controls.igg.airr <- lapply(controls.airr, function(x) {
+  x[x$c_call %in% c('IGHG1', 'IGHG2', 'IGHG3'),]
+  x[!x$sequence_alignment == '',]
+  x[!x$germline_alignment == '',]
+  x[!x$v_call == '',]
+  x$clone_id = paste(x$Sample, x$clone_id, sep = '.')
+  x$sequence_id <- paste(x$Sample, x$sequence_id, sep = '.')
+  x
+})
+
+# subset list by cat id
+c135.igg.airr <- controls.igg.airr[1:3]
+c136.igg.airr <- controls.igg.airr[4:6]
+c164.igg.airr <- controls.igg.airr[7:9]
+c174.igg.airr <- controls.igg.airr[10:12]
+c188.igg.airr <- controls.igg.airr[13:15]
+c54.igg.airr <- controls.igg.airr[16:18]
+c69.igg.airr <- controls.igg.airr[19:21]
+
+cats.igg.airr <- list(c135.igg.airr, c136.igg.airr, c164.igg.airr, c174.igg.airr, c188.igg.airr, c54.igg.airr, c69.igg.airr)
+
+# collapse each sublist into single dataframe
+cats.igg.comb <- lapply(cats.igg.airr, function(x) {
+  bind_rows(x, .id = 'Sample')
+})
+
+names(cats.igg.comb) <- c('control_135', 'control_136', 'control_164', 'control_174', 'control_188', 'control_54', 'control_69')
+
+cats.igg.clns <- lapply(cats.igg.comb, function(x) {
+  collapseClones(x, cloneColumn = "clone_id", 
+                    sequenceColumn = "sequence_alignment",
+                    germlineColumn = "germline_alignment",
+                    method="thresholdedFreq", minimumFrequency=0.6,
+                    includeAmbiguous=FALSE, breakTiesStochastic=FALSE,
+                    nproc = 2)
+})
+
+# create single df
+all.igg.clns <- bind_rows(cats.igg.clns)
+
+# remove rows with missing info
+all.igg.clns <- all.igg.clns[all.igg.clns$clonal_sequence != '',]
+
+# Create targeting model in one step using only silent mutations
+# Use consensus sequence input and germline columns
+model <- createTargetingModel(all.igg.clns, model="s", sequenceColumn="clonal_sequence", 
+                              germlineColumn="clonal_germline", vCallColumn="v_call")
+
+# Generate plots of mutability model
+plotMutability(model, nucleotides="A", style="bar")
+plotMutability(model, nucleotides="C", style="bar")
+plotMutability(model, nucleotides="G", style="bar")
+plotMutability(model, nucleotides="T", style="bar")
+
+# apply model to all samples
+all.airr <- airr.list
+# add names as sample column
+for (i in seq_along(all.airr)) {
+  all.airr[[i]]$Sample <- names(all.airr[i])
+}
+
+# remove rows with blank sequence_alignment or c_call, reformat clone_id and sequence_id, collapse IGHG subtypes
+all.airr <- lapply(all.airr, function(x) {
+  x[!x$c_call == '',]
+  x[!x$sequence_alignment == '',]
+  x[!x$germline_alignment == '',]
+  x[!x$v_call == '',]
+  x$clone_id = paste(x$Sample, x$clone_id, sep = '.')
+  x$sequence_id <- paste(x$Sample, x$sequence_id, sep = '.')
+  x$c_call <- gsub('IGHG1|IGHG2|IGHG3', 'IGHG', x$c_call)
+  x
+})
+
+# filter for IGHG only
+ighg.airr <- lapply(all.airr, function(x) x[x$c_call == 'IGHG',])
+
+# subset list by cat id
+c135.airr <- ighg.airr[1:3]
+c136.airr <- ighg.airr[4:6]
+c164.airr <- ighg.airr[7:9]
+c174.airr <- ighg.airr[10:12]
+c188.airr <- ighg.airr[13:15]
+c54.airr <- ighg.airr[16:18]
+c69.airr <- ighg.airr[19:21]
+f120.airr <- ighg.airr[22:23]
+f142.airr <- ighg.airr[24:26]
+f172.airr <- ighg.airr[27:29]
+f192.airr <- ighg.airr[30:32]
+f37.airr <- ighg.airr[33:34]
+f68.airr <- ighg.airr[35:37]
+f86.airr <- ighg.airr[38:40]
+f96.airr <- ighg.airr[41:42]
+
+cats.airr <- list(c135.airr, c136.airr, c164.airr, c174.airr, c188.airr, c54.airr, c69.airr,
+                  f120.airr, f142.airr, f172.airr, f192.airr, f37.airr, f68.airr, f86.airr, f96.airr)
+
+# collapse each sublist into single dataframe
+cats.comb <- lapply(cats.airr, function(x) {
+  bind_rows(x, .id = 'Sample')
+})
+
+names(cats.comb) <- c('control_135', 'control_136', 'control_164', 'control_174', 'control_188', 'control_54', 'control_69', 
+                      'fip_120', 'fip_142', 'fip_172', 'fip_192', 'fip_37', 'fip_68', 'fip_86', 'fip_96')
+
+cats.clns <- lapply(cats.comb, function(x) {
+  collapseClones(x, cloneColumn = "clone_id", 
+                    sequenceColumn = "sequence_alignment",
+                    germlineColumn = "germline_alignment",
+                    regionDefinition=IMGT_V, 
+                    method="thresholdedFreq", minimumFrequency=0.6,
+                    includeAmbiguous=FALSE, breakTiesStochastic=FALSE,
+                    nproc = 2)
+})
+
+# create single df
+all.clns <- bind_rows(cats.clns, .id = 'Sample')
+
+# remove rows with missing info
+all.clns <- all.clns[!all.clns$clonal_sequence == '',]
+
+# Count observed mutations and append mu_count columns to the output
+observed <- observedMutations(all.clns, 
+                              sequenceColumn="clonal_sequence",
+                              germlineColumn="clonal_germline",
+                              regionDefinition=IMGT_V, nproc=1)
+
+expected <- expectedMutations(observed, 
+                              sequenceColumn="clonal_sequence",
+                              germlineColumn="clonal_germline",
+                              targetingModel=model,
+                              regionDefinition=IMGT_V, nproc=1)
+
+# add metadata
+expected$Group <- ifelse(grepl('control', expected$Sample), 'Control', 'FIP')
+expected$Tissue <- ifelse(grepl('liver', expected$clone_id), 'Liver',
+                              ifelse(grepl('lung', expected$clone_id), 'Lung',
+                                     'MLN'))
+
+# Calculate selection scores using the output from expectedMutations
+baseline <- calcBaseline(expected, testStatistic="focused", targetingModel = model,
+                         regionDefinition=IMGT_V, nproc=1)
+
+# First group by subject and status
+subject_grouped <- groupBaseline(baseline, groupBy = c("Group", "Tissue"))
+
+# Then group the output by status
+status_grouped <- groupBaseline(subject_grouped, groupBy = "Group")
+
+testBaseline(status_grouped, groupBy = "Group")
+
+# Plot mean and confidence interval by group
+# Group by CDR/FWR and facet by isotype
+status_grouped@stats$Group <- factor(status_grouped@stats$Group, levels = c('FIP', 'Control'))
+
+plotBaselineSummary(status_grouped, idColumn = "Group") + 
+  coord_flip() +
+  labs(y = 'Σ (selection score)', x = '') +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+
