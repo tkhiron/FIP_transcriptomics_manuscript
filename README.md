@@ -5,3 +5,5 @@ Thomas K. Hiron, Sara Falcone, The MASCOT Consortium, Anja Kipar, Melanie J. Hez
 bioRxiv 2025.10.02.679983; doi: https://doi.org/10.1101/2025.10.02.679983
 
 This project is licensed under the terms of the [MIT license](https://github.com/tkhiron/FIP_transcriptomics_manuscript/blob/main/LICENSE.txt).
+
+[![DOI](https://zenodo.org/badge/1263074575.svg)](https://doi.org/10.5281/zenodo.22238023)
